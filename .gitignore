@@ -1,0 +1,4 @@
+.env
+test_result_*.json
+__pycache__/
+*.pyc
