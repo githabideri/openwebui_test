@@ -13,10 +13,7 @@ set -e  # Exit on error
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Load .env file
-if [ -f "$SCRIPT_DIR/.env" ]; then
-    echo "Loading configuration from .env file..."
-    export $(grep -v '^#' "$SCRIPT_DIR/.env" | xargs)
-else
+if [ ! -f "$SCRIPT_DIR/.env" ]; then
     echo "ERROR: .env file not found in $SCRIPT_DIR"
     echo "Please create a .env file with:"
     echo "  BASE=https://your-openwebui-instance.com"
@@ -24,6 +21,51 @@ else
     echo "  MODEL=gemma3:4b"
     exit 1
 fi
+
+echo "Loading configuration from .env file..."
+
+if ! command -v jq &> /dev/null; then
+    echo "ERROR: jq is required for this script. Please install jq and rerun."
+    exit 1
+fi
+
+trim() {
+    local var="$1"
+    var="${var#${var%%[![:space:]]*}}"
+    var="${var%${var##*[![:space:]]}}"
+    printf '%s' "$var"
+}
+
+strip_quotes() {
+    local val="$1"
+    if [[ ${#val} -ge 2 ]]; then
+        local first="${val:0:1}"
+        local last="${val: -1}"
+        if [[ ( "$first" == '"' && "$last" == '"' ) || ( "$first" == "'" && "$last" == "'" ) ]]; then
+            val="${val:1:${#val}-2}"
+        fi
+    fi
+    printf '%s' "$val"
+}
+
+while IFS= read -r line || [ -n "$line" ]; do
+    line="$(trim "$line")"
+    [ -z "$line" ] && continue
+    [[ "$line" == \#* ]] && continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="$(trim "$key")"
+    value="$(trim "$value")"
+    case "$key" in
+        BASE|TOKEN|MODEL)
+            value="$(strip_quotes "$value")"
+            export "$key=$value"
+            ;;
+        *)
+            continue
+            ;;
+    esac
+done < "$SCRIPT_DIR/.env"
 
 # Validate required variables
 if [ -z "$BASE" ] || [ -z "$TOKEN" ] || [ -z "$MODEL" ]; then
@@ -83,7 +125,7 @@ generate_uuid() {
 
 # Get timestamp in milliseconds
 get_timestamp() {
-    echo $(($(date +%s) * 1000))
+    echo $(date +%s)
 }
 
 # ============================================================================
@@ -106,10 +148,18 @@ verify_spinner_gone() {
     fi
     
     # Extract assistant message content from messages array (what UI displays)
-    local UI_CONTENT=$(echo "$CHAT_DATA" | jq -r ".messages[] | select(.id==\"$ASSISTANT_MSG_ID\" and .role==\"assistant\") | .content")
+    local UI_CONTENT=$(echo "$CHAT_DATA" | jq -r --arg assistant "$ASSISTANT_MSG_ID" '
+        ((.chat.messages // .messages // [])
+            | map(select(.id == $assistant and .role == "assistant"))
+            | .[0].content) // empty
+    ')
     
     # Extract assistant message content from history (backend state)
-    local HISTORY_CONTENT=$(echo "$CHAT_DATA" | jq -r ".history.messages[\"$ASSISTANT_MSG_ID\"].content")
+    local HISTORY_CONTENT=$(echo "$CHAT_DATA" | jq -r --arg assistant "$ASSISTANT_MSG_ID" '
+        ((.chat.history.messages // .history.messages // {})
+            | .[$assistant]
+            | .content) // empty
+    ')
     
     info "Verification Results:"
     echo ""
@@ -120,7 +170,7 @@ verify_spinner_gone() {
         error "      This means the spinner will still show!"
         echo ""
         echo "Current state:"
-        echo "$CHAT_DATA" | jq '.messages[] | select(.role=="assistant")'
+        echo "$CHAT_DATA" | jq '.chat.messages // .messages // [] | map(select(.role=="assistant"))'
         return 1
     else
         success "PASS: Assistant message has content in messages[] array (UI displays this)"
@@ -137,7 +187,9 @@ verify_spinner_gone() {
     fi
     
     # Check 3: Verify we can identify the currentId
-    local CURRENT_ID=$(echo "$CHAT_DATA" | jq -r '.history.currentId // .currentId // .history.current_id')
+    local CURRENT_ID=$(echo "$CHAT_DATA" | jq -r '
+        .chat.history.currentId // .chat.history.current_id // .chat.currentId // .history.currentId // .history.current_id // .currentId // empty
+    ')
     if [ "$CURRENT_ID" = "$ASSISTANT_MSG_ID" ] || [ "$CURRENT_ID" = "null" ]; then
         success "PASS: Chat state looks correct"
     else
@@ -160,30 +212,54 @@ test_chat_continuable() {
     
     # Generate IDs for follow-up
     local FOLLOWUP_USER_ID=$(generate_uuid)
-    local FOLLOWUP_ASSISTANT_ID=$(generate_uuid)
     local FOLLOWUP_TIMESTAMP=$(get_timestamp)
     
-    # Try to add a follow-up user message
-    local FOLLOWUP_RESPONSE=$(curl -s -X POST "$BASE/api/v1/chats/$CHAT_ID/messages" \
+    local CHAT_RESPONSE=$(curl -s -X GET "$BASE/api/v1/chats/$CHAT_ID" \
+        -H "Authorization: Bearer $TOKEN")
+
+    local CHAT_JSON=$(echo "$CHAT_RESPONSE" | jq --arg chat_id "$CHAT_ID" '(.chat // .) | .id = $chat_id')
+
+    local FOLLOWUP_MESSAGE=$(jq -n \
+        --arg id "$FOLLOWUP_USER_ID" \
+        --arg parent "$ASSISTANT_MSG_ID" \
+        --arg model "$MODEL" \
+        --argjson timestamp $FOLLOWUP_TIMESTAMP \
+        '{
+            id: $id,
+            role: "user",
+            content: "Thanks! One more test.",
+            parentId: $parent,
+            timestamp: $timestamp,
+            models: [$model]
+        }'
+    )
+
+    local UPDATED_CHAT=$(echo "$CHAT_JSON" | jq \
+        --argjson message "$FOLLOWUP_MESSAGE" \
+        --arg id "$FOLLOWUP_USER_ID" \
+        '.messages = (.messages // []) + [$message]
+         | .history = (.history // {})
+         | .history.messages = (.history.messages // {})
+         | .history.messages[$id] = $message
+         | .history.current_id = $id
+         | .history.currentId = $id
+         | .currentId = $id'
+    )
+
+    local UPDATE_BODY=$(echo "$UPDATED_CHAT" | jq -c '{chat: .}')
+    local UPDATE_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/api/v1/chats/$CHAT_ID" \
         -H "Authorization: Bearer $TOKEN" \
         -H "Content-Type: application/json" \
-        -d "{
-            \"id\": \"$FOLLOWUP_USER_ID\",
-            \"role\": \"user\",
-            \"content\": \"Thanks! One more test.\",
-            \"parentId\": \"$ASSISTANT_MSG_ID\",
-            \"timestamp\": $FOLLOWUP_TIMESTAMP,
-            \"models\": [\"$MODEL\"]
-        }")
-    
-    if echo "$FOLLOWUP_RESPONSE" | grep -q "error\|Error\|ERROR"; then
-        warn "Could not add follow-up message (this might be expected)"
+        -d "$UPDATE_BODY")
+
+    if [ "$UPDATE_STATUS" != "200" ] && [ "$UPDATE_STATUS" != "201" ]; then
+        warn "Could not add follow-up message (status: $UPDATE_STATUS)"
         return 1
-    else
-        success "Follow-up message added successfully"
-        info "Chat is definitely continuable!"
-        return 0
     fi
+
+    success "Follow-up message added successfully"
+    info "Chat is definitely continuable!"
+    return 0
 }
 
 # ============================================================================
@@ -246,21 +322,15 @@ run_complete_test() {
             }
         }")
     
-    if command -v jq &> /dev/null; then
-        local CHAT_ID=$(echo "$STEP1_RESPONSE" | jq -r '.chat.id')
-        local SUCCESS=$(echo "$STEP1_RESPONSE" | jq -r '.success')
-        
-        if [ "$SUCCESS" = "true" ] && [ "$CHAT_ID" != "null" ]; then
-            success "Chat created: $CHAT_ID"
-        else
-            error "Failed to create chat"
-            echo "$STEP1_RESPONSE" | jq .
-            exit 1
-        fi
-    else
-        local CHAT_ID=$(echo "$STEP1_RESPONSE" | grep -o '"id":"[^"]*"' | head -1 | sed 's/"id":"\([^"]*\)"/\1/')
-        success "Chat created: $CHAT_ID"
+    local CHAT_ID=$(echo "$STEP1_RESPONSE" | jq -r '.chat.id // .id // empty')
+    if [ -z "$CHAT_ID" ]; then
+        error "Failed to create chat"
+        echo "$STEP1_RESPONSE" | jq .
+        exit 1
     fi
+
+    local CHAT_JSON=$(echo "$STEP1_RESPONSE" | jq --arg chat_id "$CHAT_ID" '(.chat // .) | .id = $chat_id')
+    success "Chat created: $CHAT_ID"
     echo ""
     
     # ========================================================================
@@ -269,21 +339,51 @@ run_complete_test() {
     log "STEP 2: Injecting assistant message placeholder..."
     
     local ASSISTANT_TIMESTAMP=$(get_timestamp)
-    
-    curl -s -X POST "$BASE/api/v1/chats/$CHAT_ID/messages" \
+    local ASSISTANT_MESSAGE=$(jq -n \
+        --arg id "$ASSISTANT_MSG_ID" \
+        --arg parent "$USER_MSG_ID" \
+        --arg model "$MODEL" \
+        --argjson timestamp $ASSISTANT_TIMESTAMP \
+        '{
+            id: $id,
+            role: "assistant",
+            content: "",
+            parentId: $parent,
+            modelName: $model,
+            modelIdx: 0,
+            timestamp: $timestamp,
+            done: false,
+            statusHistory: []
+        }'
+    )
+
+    local UPDATED_CHAT=$(echo "$CHAT_JSON" | jq \
+        --argjson assistant "$ASSISTANT_MESSAGE" \
+        --arg id "$ASSISTANT_MSG_ID" \
+        '.messages = (.messages // []) + [$assistant]
+         | .history = (.history // {})
+         | .history.messages = (.history.messages // {})
+         | .history.messages[$id] = $assistant
+         | .history.current_id = $id
+         | .history.currentId = $id
+         | .currentId = $id'
+    )
+
+    local STEP2_BODY=$(echo "$UPDATED_CHAT" | jq -c '{chat: .}')
+    local STEP2_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/api/v1/chats/$CHAT_ID" \
         -H "Authorization: Bearer $TOKEN" \
         -H "Content-Type: application/json" \
-        -d "{
-            \"id\": \"$ASSISTANT_MSG_ID\",
-            \"role\": \"assistant\",
-            \"content\": \"\",
-            \"parentId\": \"$USER_MSG_ID\",
-            \"modelName\": \"$MODEL\",
-            \"modelIdx\": 0,
-            \"timestamp\": $ASSISTANT_TIMESTAMP
-        }" > /dev/null
-    
+        -d "$STEP2_BODY")
+
+    if [ "$STEP2_STATUS" != "200" ] && [ "$STEP2_STATUS" != "201" ]; then
+        error "Failed to update chat with assistant placeholder (status: $STEP2_STATUS)"
+        exit 1
+    fi
+
     success "Assistant placeholder injected"
+    echo ""
+    
+    CHAT_JSON=$UPDATED_CHAT
     echo ""
     
     # ========================================================================
@@ -293,20 +393,26 @@ run_complete_test() {
     
     local CURRENT_DATETIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     
-    curl -s -X POST "$BASE/api/chat/completions" \
+    local CONVERSATION=$(echo "$CHAT_JSON" | jq -c '[
+        (.messages // [])
+        | map(select(.role == "user" or .role == "assistant"))
+        | .[]
+        | select(.role != "assistant" or ((.content // "") != ""))
+        | {role: .role, content: (.content // "")}
+    ]')
+    if [ -z "$CONVERSATION" ] || [ "$CONVERSATION" = "[]" ]; then
+        CONVERSATION="[{\"role\":\"user\",\"content\":\"$TEST_MESSAGE\"}]"
+    fi
+
+    local COMPLETION_RESPONSE=$(curl -s -X POST "$BASE/api/chat/completions" \
         -H "Authorization: Bearer $TOKEN" \
         -H "Content-Type: application/json" \
         -d "{
             \"chat_id\": \"$CHAT_ID\",
             \"id\": \"$ASSISTANT_MSG_ID\",
-            \"messages\": [
-                {
-                    \"role\": \"user\",
-                    \"content\": \"$TEST_MESSAGE\"
-                }
-            ],
+            \"messages\": $CONVERSATION,
             \"model\": \"$MODEL\",
-            \"stream\": true,
+            \"stream\": false,
             \"background_tasks\": {
                 \"title_generation\": false,
                 \"tags_generation\": false,
@@ -320,13 +426,63 @@ run_complete_test() {
             },
             \"variables\": {
                 \"{{USER_NAME}}\": \"\",
-                \"{{USER_LANGUAGE}}\": \"en-US\",
-                \"{{CURRENT_DATETIME}}\": \"$CURRENT_DATETIME\",
-                \"{{CURRENT_TIMEZONE}}\": \"UTC\"
+            \"{{USER_LANGUAGE}}\": \"en-US\",
+            \"{{CURRENT_DATETIME}}\": \"$CURRENT_DATETIME\",
+            \"{{CURRENT_TIMEZONE}}\": \"UTC\"
             },
             \"session_id\": \"$SESSION\"
-        }" > /dev/null
-    
+        }")
+
+    local ASSISTANT_TEXT=$(echo "$COMPLETION_RESPONSE" | jq -r '
+        def choice_text: (.message.content // .delta.content // .content // "");
+        if type == "object" then
+            if (.choices and (.choices | type == "array")) then
+                (.choices | map(choice_text) | join(""))
+            elif (.message and (.message.content // "") != "") then
+                .message.content
+            elif (.content // "") != "" then
+                .content
+            else
+                ""
+            end
+        else
+            ""
+        end
+    ')
+
+    if [ -n "$ASSISTANT_TEXT" ] && [ "$ASSISTANT_TEXT" != "null" ]; then
+        local SYNCED_CHAT=$(echo "$UPDATED_CHAT" | jq --arg assistant "$ASSISTANT_MSG_ID" --arg text "$ASSISTANT_TEXT" '
+            (.messages // []) as $messages
+            | ([ $messages[]? | select(.id == $assistant) ] | .[0]) as $message_entry
+            | (.history.messages[$assistant] // {}) as $history_entry
+            | ($history_entry + ($message_entry // {}) + {id: $assistant, role: ($history_entry.role // ($message_entry.role // "assistant"))}) as $template
+            | .messages = if ([ $messages[]? | select(.id == $assistant) ] | length) > 0 then
+                [ $messages[] | if .id == $assistant then . + {content: $text, done: true, statusHistory: (.statusHistory // [])} else . end ]
+              else
+                $messages + [ $template + {content: $text, done: true, statusHistory: []} ]
+              end
+            | .history = (.history // {})
+            | .history.messages = (.history.messages // {})
+            | .history.messages[$assistant] = $template + {content: $text, done: true}
+            | .history.current_id = $assistant
+            | .history.currentId = $assistant
+            | .currentId = $assistant
+        ')
+
+        local SYNC_BODY=$(echo "$SYNCED_CHAT" | jq -c '{chat: .}')
+        local SYNC_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/api/v1/chats/$CHAT_ID" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$SYNC_BODY")
+
+        if [ "$SYNC_STATUS" = "200" ] || [ "$SYNC_STATUS" = "201" ]; then
+            CHAT_JSON=$SYNCED_CHAT
+            info "Assistant reply captured: ${ASSISTANT_TEXT:0:80}..."
+        else
+            warn "Could not sync assistant content after completion (status: $SYNC_STATUS)"
+        fi
+    fi
+
     success "Completion triggered"
     echo ""
     
@@ -367,23 +523,58 @@ run_complete_test() {
         local POLL_RESPONSE=$(curl -s -X GET "$BASE/api/v1/chats/$CHAT_ID" \
             -H "Authorization: Bearer $TOKEN")
         
-        if command -v jq &> /dev/null; then
-            local CONTENT=$(echo "$POLL_RESPONSE" | jq -r ".messages[] | select(.id==\"$ASSISTANT_MSG_ID\" and .role==\"assistant\") | .content")
-            
-            if [ -n "$CONTENT" ] && [ "$CONTENT" != "" ] && [ "$CONTENT" != "null" ]; then
-                RESPONSE_READY=true
-                success "Response ready after $ATTEMPT attempts"
-                break
-            fi
-        else
-            if echo "$POLL_RESPONSE" | grep -q "\"id\":\"$ASSISTANT_MSG_ID\"" && \
-               echo "$POLL_RESPONSE" | grep -A 5 "\"id\":\"$ASSISTANT_MSG_ID\"" | grep -q "\"content\":\"[^\"]\+\""; then
-                RESPONSE_READY=true
-                success "Response ready after $ATTEMPT attempts"
-                break
+        local CONTENT=$(echo "$POLL_RESPONSE" | jq -r --arg assistant "$ASSISTANT_MSG_ID" '
+            ((.chat.messages // .messages // [])
+                | map(select(.id == $assistant and .role == "assistant"))
+                | .[0].content) // ""
+        ')
+
+        local HISTORY_CONTENT=$(echo "$POLL_RESPONSE" | jq -r --arg assistant "$ASSISTANT_MSG_ID" '
+            ((.chat.history.messages // .history.messages // {})[$assistant].content) // ""
+        ')
+
+        if { [ -z "$CONTENT" ] || [ "$CONTENT" = "null" ]; } && [ -n "$HISTORY_CONTENT" ] && [ "$HISTORY_CONTENT" != "null" ]; then
+            local SYNCED_CHAT=$(echo "$POLL_RESPONSE" | jq --arg assistant "$ASSISTANT_MSG_ID" --arg text "$HISTORY_CONTENT" '
+                (.chat // .) as $chat
+                | $chat
+                | (.messages // []) as $messages
+                | ([ $messages[]? | select(.id == $assistant) ] | .[0]) as $message_entry
+                | (.history.messages[$assistant] // {}) as $history_entry
+                | ($history_entry + ($message_entry // {}) + {id: $assistant, role: ($history_entry.role // ($message_entry.role // "assistant"))}) as $template
+                | .messages = if ([ $messages[]? | select(.id == $assistant) ] | length) > 0 then
+                    [ $messages[] | if .id == $assistant then . + {content: $text, done: true, statusHistory: (.statusHistory // [])} else . end ]
+                  else
+                    $messages + [ $template + {content: $text, done: true, statusHistory: []} ]
+                  end
+                | .history = (.history // {})
+                | .history.messages = (.history.messages // {})
+                | .history.messages[$assistant] = $template + {content: $text, done: true}
+                | .history.current_id = $assistant
+                | .history.currentId = $assistant
+                | .currentId = $assistant
+            ')
+
+            local SYNC_BODY=$(echo "$SYNCED_CHAT" | jq -c '{chat: .}')
+            local SYNC_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/api/v1/chats/$CHAT_ID" \
+                -H "Authorization: Bearer $TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "$SYNC_BODY")
+
+            if [ "$SYNC_STATUS" = "200" ] || [ "$SYNC_STATUS" = "201" ]; then
+                CONTENT="$HISTORY_CONTENT"
+                CHAT_JSON=$SYNCED_CHAT
+                success "Synchronized assistant content from history"
+            else
+                warn "Failed to synchronize assistant content during polling (status: $SYNC_STATUS)"
             fi
         fi
-        
+
+        if [ -n "$CONTENT" ] && [ "$CONTENT" != "" ] && [ "$CONTENT" != "null" ]; then
+            RESPONSE_READY=true
+            success "Response ready after $ATTEMPT attempts"
+            break
+        fi
+
         log "  Attempt $ATTEMPT/$MAX_ATTEMPTS: Waiting for response..."
         sleep $POLL_INTERVAL
     done
@@ -414,7 +605,11 @@ run_complete_test() {
         if command -v jq &> /dev/null; then
             local FINAL_CHAT=$(curl -s -X GET "$BASE/api/v1/chats/$CHAT_ID" \
                 -H "Authorization: Bearer $TOKEN")
-            local RESPONSE_TEXT=$(echo "$FINAL_CHAT" | jq -r ".messages[] | select(.id==\"$ASSISTANT_MSG_ID\") | .content")
+            local RESPONSE_TEXT=$(echo "$FINAL_CHAT" | jq -r --arg assistant "$ASSISTANT_MSG_ID" '
+                ((.chat.messages // .messages // [])
+                    | map(select(.id == $assistant))
+                    | .[0].content) // empty
+            ')
             
             info "Assistant Response:"
             echo ""

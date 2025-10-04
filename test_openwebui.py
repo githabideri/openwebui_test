@@ -14,8 +14,8 @@ import time
 import uuid
 import os
 import sys
-from typing import Dict, Optional, Tuple
-from datetime import datetime
+from typing import Dict, Optional, Tuple, List
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -88,13 +88,148 @@ class OpenWebUITester:
             if hasattr(e, 'response') and e.response is not None:
                 self._log(f"Response: {e.response.text[:500]}", "ERROR")
             raise
-            
+
+    def _extract_assistant_text(self, completion_result: Dict) -> str:
+        """Extract assistant content from the completion response."""
+        if not isinstance(completion_result, dict):
+            return ""
+
+        def collect_from_choices(choices: List[Dict]) -> str:
+            parts: List[str] = []
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    continue
+                message = choice.get("message")
+                if isinstance(message, dict):
+                    content = message.get("content")
+                    if isinstance(content, str):
+                        parts.append(content)
+                delta = choice.get("delta")
+                if isinstance(delta, dict):
+                    delta_content = delta.get("content")
+                    if isinstance(delta_content, str):
+                        parts.append(delta_content)
+                direct_content = choice.get("content")
+                if isinstance(direct_content, str):
+                    parts.append(direct_content)
+            combined = "".join(parts).strip()
+            return combined
+
+        choices = completion_result.get("choices")
+        if isinstance(choices, list):
+            text = collect_from_choices(choices)
+            if text:
+                return text
+
+        message = completion_result.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+
+        content = completion_result.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+
+        data = completion_result.get("data")
+        if isinstance(data, dict):
+            nested = self._extract_assistant_text(data)
+            if nested:
+                return nested
+
+        return ""
+
+    @staticmethod
+    def _find_parent_id(chat_view: Dict, assistant_msg_id: str) -> Optional[str]:
+        """Find the parentId for the assistant message if present."""
+        history = chat_view.get("history", {})
+        history_messages = history.get("messages", {})
+        if isinstance(history_messages, dict):
+            entry = history_messages.get(assistant_msg_id)
+            if isinstance(entry, dict):
+                parent = entry.get("parentId")
+                if parent:
+                    return parent
+
+        for msg in chat_view.get("messages", []) or []:
+            if isinstance(msg, dict) and msg.get("id") == assistant_msg_id:
+                parent = msg.get("parentId")
+                if parent:
+                    return parent
+
+        return None
+
+    def _sync_assistant_content(
+        self,
+        chat_id: str,
+        chat_view: Dict,
+        assistant_msg_id: str,
+        content: str,
+    ) -> Dict:
+        """Ensure assistant content is present in both messages[] and history."""
+        if not content or not content.strip():
+            return chat_view
+
+        updated_chat = json.loads(json.dumps(chat_view))
+        updated_chat["id"] = chat_id
+
+        messages = updated_chat.setdefault("messages", [])
+        assistant_entry = None
+        for message in messages:
+            if message.get("id") == assistant_msg_id:
+                assistant_entry = message
+                break
+
+        if assistant_entry is None:
+            assistant_entry = {
+                "id": assistant_msg_id,
+                "role": "assistant",
+                "content": content,
+                "parentId": self._find_parent_id(chat_view, assistant_msg_id),
+                "modelName": self.model,
+                "modelIdx": 0,
+                "timestamp": int(time.time()),
+                "done": True,
+            }
+            messages.append(assistant_entry)
+        else:
+            assistant_entry["content"] = content
+            assistant_entry["done"] = True
+            assistant_entry.setdefault("statusHistory", [])
+
+        history = updated_chat.setdefault("history", {})
+        history_messages = history.setdefault("messages", {})
+        history_entry = history_messages.get(assistant_msg_id)
+        if not isinstance(history_entry, dict):
+            history_entry = {
+                "id": assistant_msg_id,
+                "role": "assistant",
+                "parentId": assistant_entry.get("parentId"),
+                "modelName": assistant_entry.get("modelName", self.model),
+                "modelIdx": assistant_entry.get("modelIdx", 0),
+                "timestamp": assistant_entry.get("timestamp", int(time.time())),
+            }
+        history_entry["content"] = content
+        history_entry["done"] = True
+        history_messages[assistant_msg_id] = history_entry
+        history["current_id"] = assistant_msg_id
+        history["currentId"] = assistant_msg_id
+        updated_chat["currentId"] = assistant_msg_id
+
+        try:
+            self._make_request("POST", f"/api/v1/chats/{chat_id}", {"chat": updated_chat})
+            self._log("Assistant content synchronized with chat state", "DETAIL")
+            return updated_chat
+        except Exception as sync_error:
+            self._log(f"Failed to synchronize assistant content: {sync_error}", "WARNING")
+            return chat_view
+
     def step1_create_chat(self, user_message: str) -> Dict:
         """Step 1: Create a new chat with a user message."""
         self._log("STEP 1: Creating chat...")
         
         user_msg_id = str(uuid.uuid4())
-        timestamp = int(time.time() * 1000)
+        timestamp = int(time.time())
         
         payload = {
             "chat": {
@@ -125,51 +260,120 @@ class OpenWebUITester:
         }
         
         result = self._make_request("POST", "/api/v1/chats/new", payload)
-        
-        if result.get("success"):
-            chat_id = result["chat"]["id"]
+
+        chat_payload: Optional[Dict] = None
+        chat_id: Optional[str] = None
+        if isinstance(result, dict):
+            # Preferred shape: {"success": True, "chat": {...}}
+            if result.get("success") and isinstance(result.get("chat"), dict):
+                chat_payload = json.loads(json.dumps(result["chat"]))
+            # Some deployments drop the success flag and return the chat object directly
+            elif isinstance(result.get("chat"), dict):
+                chat_payload = json.loads(json.dumps(result["chat"]))
+            # Other builds wrap chat inside a data envelope
+            elif isinstance(result.get("data"), dict) and isinstance(result["data"].get("chat"), dict):
+                chat_payload = json.loads(json.dumps(result["data"]["chat"]))
+            # Fallback: the top-level object already looks like a chat
+            elif {"id", "messages"}.issubset(result.keys()):
+                chat_payload = json.loads(json.dumps(result))
+            elif result.get("chat_id"):
+                chat_payload = json.loads(json.dumps({k: v for k, v in result.items() if k not in {"success", "status", "chat_id"}}))
+                chat_payload["id"] = result["chat_id"]
+
+            if isinstance(result.get("id"), str):
+                chat_id = result["id"]
+
+        if chat_payload:
+            chat_id = chat_payload.get("id") or chat_id
+            if not chat_id and isinstance(result, dict) and isinstance(result.get("chat"), dict):
+                chat_id = result.get("id")
+                if chat_id:
+                    chat_payload["id"] = chat_id
+
+        if chat_payload and chat_id:
             self._log(f"Chat created: {chat_id}", "SUCCESS")
-            return {"chat_id": chat_id, "user_msg_id": user_msg_id}
-        else:
-            raise Exception("Failed to create chat")
+            return {
+                "chat_id": chat_id,
+                "user_msg_id": user_msg_id,
+                "chat_payload": chat_payload
+            }
+
+        safe_preview = json.dumps(result, indent=2)[:500] if isinstance(result, dict) else str(result)
+        self._log("Failed to create chat - unexpected response", "ERROR")
+        self._log(f"Response preview: {safe_preview}", "DETAIL")
+        raise Exception("Failed to create chat")
             
-    def step2_inject_assistant_message(self, chat_id: str, user_msg_id: str) -> str:
+    def step2_inject_assistant_message(self, chat_id: str, user_msg_id: str,
+                                       chat_payload: Dict) -> Tuple[str, Dict]:
         """Step 2: Inject empty assistant message placeholder."""
         self._log("STEP 2: Injecting assistant message placeholder...")
         
         assistant_msg_id = str(uuid.uuid4())
-        timestamp = int(time.time() * 1000)
+        timestamp = int(time.time())
         
-        payload = {
+        assistant_message = {
             "id": assistant_msg_id,
             "role": "assistant",
             "content": "",
             "parentId": user_msg_id,
             "modelName": self.model,
             "modelIdx": 0,
-            "timestamp": timestamp
+            "timestamp": timestamp,
+            "done": False,
+            "statusHistory": [],
         }
+
+        updated_chat = json.loads(json.dumps(chat_payload))
+        messages = updated_chat.setdefault("messages", [])
+        messages.append(assistant_message)
+
+        history = updated_chat.setdefault("history", {})
+        history_messages = history.setdefault("messages", {})
+        history_messages[assistant_msg_id] = dict(assistant_message)
+        history["current_id"] = assistant_msg_id
+        history["currentId"] = assistant_msg_id
+
+        updated_chat["currentId"] = assistant_msg_id
+        updated_chat["id"] = chat_id
+
+        self._make_request("POST", f"/api/v1/chats/{chat_id}", {"chat": updated_chat})
+        self._log("Assistant placeholder injected", "SUCCESS")
+
+        return assistant_msg_id, updated_chat
         
-        self._make_request("POST", f"/api/v1/chats/{chat_id}/messages", payload)
-        self._log(f"Assistant placeholder injected", "SUCCESS")
-        
-        return assistant_msg_id
-        
-    def step3_trigger_completion(self, chat_id: str, assistant_msg_id: str, user_message: str) -> None:
+    def step3_trigger_completion(
+        self,
+        chat_id: str,
+        assistant_msg_id: str,
+        user_message: str,
+        chat_state: Dict,
+    ) -> Tuple[Dict, str]:
         """Step 3: Trigger the assistant completion."""
         self._log("STEP 3: Triggering completion...")
         
+        conversation: List[Dict[str, str]] = []
+        for message in chat_state.get("messages", []) or []:
+            role = message.get("role")
+            content = message.get("content", "")
+            if not role or content is None:
+                continue
+            if role not in {"user", "assistant"}:
+                continue
+            if role == "assistant" and not content.strip():
+                continue
+            conversation.append({
+                "role": role,
+                "content": content,
+            })
+        if not conversation:
+            conversation.append({"role": "user", "content": user_message})
+
         payload = {
             "chat_id": chat_id,
             "id": assistant_msg_id,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": user_message
-                }
-            ],
+            "messages": conversation,
             "model": self.model,
-            "stream": True,
+            "stream": False,
             "background_tasks": {
                 "title_generation": False,
                 "tags_generation": False,
@@ -184,14 +388,30 @@ class OpenWebUITester:
             "variables": {
                 "{{USER_NAME}}": "",
                 "{{USER_LANGUAGE}}": "en-US",
-                "{{CURRENT_DATETIME}}": datetime.utcnow().isoformat() + "Z",
+                "{{CURRENT_DATETIME}}": datetime.now(timezone.utc).isoformat(),
                 "{{CURRENT_TIMEZONE}}": "UTC"
             },
             "session_id": self.session_id
         }
             
-        self._make_request("POST", "/api/chat/completions", payload)
-        self._log("Completion triggered", "SUCCESS")
+        result = self._make_request("POST", "/api/chat/completions", payload)
+        preview = json.dumps(result, indent=2)[:400] if isinstance(result, dict) else str(result)[:400]
+        self._log(f"Completion response preview: {preview}", "DETAIL")
+
+        assistant_text = ""
+        if isinstance(result, dict):
+            if result.get("error"):
+                self._log(f"Completion response reported error: {result.get('error')}", "ERROR")
+            assistant_text = self._extract_assistant_text(result)
+
+        if assistant_text:
+            chat_state = self._sync_assistant_content(chat_id, chat_state, assistant_msg_id, assistant_text)
+            snippet = assistant_text[:80].replace('\n', ' ')
+            self._log(f"Assistant reply captured: {snippet}...", "DETAIL")
+        else:
+            self._log("Completion triggered", "SUCCESS")
+
+        return chat_state, assistant_text
         
     def step4_mark_completion(self, chat_id: str, assistant_msg_id: str) -> None:
         """Step 4: Mark the completion as done (CRITICAL - prevents spinner!)."""
@@ -214,15 +434,52 @@ class OpenWebUITester:
         
         for attempt in range(max_attempts):
             chat_data = self._make_request("GET", f"/api/v1/chats/{chat_id}")
+            chat_view = chat_data.get("chat") if isinstance(chat_data, dict) and isinstance(chat_data.get("chat"), dict) else chat_data
+            if not isinstance(chat_view, dict):
+                self._log("Unexpected chat payload structure while polling", "WARNING")
+                self._log(f"Payload preview: {str(chat_data)[:300]}", "DETAIL")
+                time.sleep(interval)
+                continue
+            if attempt == 0:
+                try:
+                    snapshot = json.dumps(chat_view)[:500]
+                    self._log(f"Chat snapshot: {snapshot}", "DETAIL")
+                except Exception:
+                    self._log("Could not serialize chat snapshot", "WARNING")
             
             # Look for assistant message with content in messages array
-            for message in chat_data.get("messages", []):
-                if (message.get("id") == assistant_msg_id and 
-                    message.get("role") == "assistant" and 
-                    message.get("content", "").strip()):
-                    self._log(f"Response ready after {attempt + 1} attempts", "SUCCESS")
-                    return chat_data
-                    
+            messages = chat_view.get("messages") or []
+            ui_message = None
+            for message in messages:
+                if (message.get("id") == assistant_msg_id and
+                        message.get("role") == "assistant"):
+                    ui_message = message
+                    break
+
+            history_container = chat_view.get("history") or {}
+            history_messages = history_container.get("messages", {}) or {}
+            history_message = history_messages.get(assistant_msg_id)
+            history_content = ""
+            if isinstance(history_message, dict):
+                history_content = history_message.get("content", "") or ""
+
+            ui_content = ui_message.get("content", "") if isinstance(ui_message, dict) else ""
+
+            if ui_content.strip():
+                self._log(f"Response ready after {attempt + 1} attempts", "SUCCESS")
+                return chat_view
+
+            if history_content.strip():
+                self._log("History contains assistant content; synchronizing messages", "DETAIL")
+                chat_view = self._sync_assistant_content(chat_id, chat_view, assistant_msg_id, history_content)
+                messages = chat_view.get("messages", [])
+                for message in messages:
+                    if (message.get("id") == assistant_msg_id and
+                            message.get("role") == "assistant" and
+                            (message.get("content", "") or "").strip()):
+                        self._log(f"Response ready after {attempt + 1} attempts", "SUCCESS")
+                        return chat_view
+            
             self._log(f"  Attempt {attempt + 1}/{max_attempts}: Waiting for response...")
             time.sleep(interval)
             
@@ -244,11 +501,13 @@ class OpenWebUITester:
         self._log("="*80, "DETAIL")
         self._log("", "DETAIL")
         
-        chat_data = self._make_request("GET", f"/api/v1/chats/{chat_id}")
+        response_payload = self._make_request("GET", f"/api/v1/chats/{chat_id}")
+        chat_data = response_payload.get("chat") if isinstance(response_payload, dict) and isinstance(response_payload.get("chat"), dict) else response_payload
         
         # Extract assistant message from messages array (UI displays this)
+        messages = chat_data.get("messages") or chat_data.get("chat", {}).get("messages", [])
         ui_message = None
-        for msg in chat_data.get("messages", []):
+        for msg in messages:
             if msg.get("id") == assistant_msg_id and msg.get("role") == "assistant":
                 ui_message = msg
                 break
@@ -260,7 +519,8 @@ class OpenWebUITester:
         ui_content = ui_message.get("content", "")
         
         # Extract from history
-        history_message = chat_data.get("history", {}).get("messages", {}).get(assistant_msg_id, {})
+        history_container = chat_data.get("history") or chat_data.get("chat", {}).get("history", {})
+        history_message = history_container.get("messages", {}).get(assistant_msg_id, {})
         history_content = history_message.get("content", "")
         
         self._log("Verification Results:", "DETAIL")
@@ -288,9 +548,9 @@ class OpenWebUITester:
         
         # Check 3: Verify currentId
         current_id = (
-            chat_data.get("history", {}).get("currentId") or 
-            chat_data.get("currentId") or 
-            chat_data.get("history", {}).get("current_id")
+            history_container.get("currentId") or
+            chat_data.get("currentId") or
+            history_container.get("current_id")
         )
         
         if current_id == assistant_msg_id or not current_id:
@@ -310,10 +570,14 @@ class OpenWebUITester:
         self._log("Testing if chat is continuable by adding a follow-up message...", "DETAIL")
         
         followup_user_id = str(uuid.uuid4())
-        timestamp = int(time.time() * 1000)
+        timestamp = int(time.time())
         
         try:
-            payload = {
+            response_payload = self._make_request("GET", f"/api/v1/chats/{chat_id}")
+            chat_state = response_payload.get("chat") if isinstance(response_payload, dict) and isinstance(response_payload.get("chat"), dict) else response_payload
+            updated_chat = json.loads(json.dumps(chat_state))
+
+            user_message = {
                 "id": followup_user_id,
                 "role": "user",
                 "content": "Thanks! One more test.",
@@ -321,8 +585,20 @@ class OpenWebUITester:
                 "timestamp": timestamp,
                 "models": [self.model]
             }
-            
-            self._make_request("POST", f"/api/v1/chats/{chat_id}/messages", payload)
+
+            messages = updated_chat.setdefault("messages", [])
+            messages.append(user_message)
+
+            history = updated_chat.setdefault("history", {})
+            history_messages = history.setdefault("messages", {})
+            history_messages[followup_user_id] = dict(user_message)
+            history["current_id"] = followup_user_id
+            history["currentId"] = followup_user_id
+
+            updated_chat["currentId"] = followup_user_id
+            updated_chat["id"] = chat_id
+
+            self._make_request("POST", f"/api/v1/chats/{chat_id}", {"chat": updated_chat})
             self._log("Follow-up message added successfully", "SUCCESS")
             self._log("Chat is definitely continuable!", "DETAIL")
             return True
@@ -355,14 +631,23 @@ class OpenWebUITester:
             step1_result = self.step1_create_chat(user_message)
             chat_id = step1_result["chat_id"]
             user_msg_id = step1_result["user_msg_id"]
+            chat_state = step1_result["chat_payload"]
             print()
             
             # Step 2: Inject assistant message
-            assistant_msg_id = self.step2_inject_assistant_message(chat_id, user_msg_id)
+            assistant_msg_id, chat_state = self.step2_inject_assistant_message(
+                chat_id, user_msg_id, chat_state
+            )
             print()
             
             # Step 3: Trigger completion
-            self.step3_trigger_completion(chat_id, assistant_msg_id, user_message)
+            assistant_response = ""
+            chat_state, assistant_response = self.step3_trigger_completion(
+                chat_id,
+                assistant_msg_id,
+                user_message,
+                chat_state,
+            )
             print()
             
             # Small delay before marking complete
@@ -387,12 +672,21 @@ class OpenWebUITester:
                 }
             
             # Extract response
-            assistant_response = ""
-            for msg in final_chat.get("messages", []):
-                if msg.get("id") == assistant_msg_id:
-                    assistant_response = msg.get("content", "")
-                    break
-            
+            if not assistant_response:
+                for msg in final_chat.get("messages", []):
+                    if msg.get("id") == assistant_msg_id:
+                        assistant_response = msg.get("content", "")
+                        break
+
+            if not assistant_response:
+                history_messages = final_chat.get("history", {}).get("messages", {})
+                if isinstance(history_messages, dict):
+                    history_msg = history_messages.get(assistant_msg_id)
+                    if isinstance(history_msg, dict):
+                        assistant_response = history_msg.get("content", "")
+
+            assistant_response = assistant_response or ""
+
             # Display results
             print()
             self._log("="*80)
