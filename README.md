@@ -5,7 +5,7 @@ Tested with OpenWebUI v6.32.
 
 # OpenWebUI API Verification
 
-This repository demonstrates how to script OpenWebUI's REST APIs to create full chat sessions, capture the returned artifacts, and validate that conversations remain usable after automation. It ships both Python and Bash harnesses so teams can embed the same workflow in their preferred tooling without manual UI steps.
+This repository demonstrates how to script OpenWebUI's REST APIs to create full chat sessions, capture the returned artifacts, and validate that conversations remain usable after automation. The Python harness encapsulates the complete flow so teams can reproduce the UI behaviour without manual intervention, and an accompanying manual guide walks you through each HTTP call for debugging or learning purposes.
 
 ## What You Can Do Here
 - Generate chats end-to-end through `/api/v1/chats/*` endpoints, including message history scaffolding.
@@ -15,80 +15,18 @@ This repository demonstrates how to script OpenWebUI's REST APIs to create full 
 
 ## Repository Layout
 - `test_openwebui.py` — Python 3.10+ runner with structured logging and reusable `stepN_*` helpers.
-- `test_openwebui.sh` — Bash equivalent suited to cron jobs or lightweight CI environments.
 - `.env` — Environment configuration (not committed) holding `BASE`, `TOKEN`, and `MODEL` values for the target deployment.
+- `vendor/` — A sandbox copy of upstream projects (OpenWebUI core, UI docs, and the homedoc journal analyzer) retrieved during debugging. The directory is ignored from version control.
+- `API_FLOW.md` — Step-by-step curl walkthrough covering every API call required to replicate the automated flow manually.
 
 ## Quick Start
 1. Create a `.env` file next to the scripts with `BASE=https://your-openwebui`, `TOKEN=your-api-token`, and `MODEL=gemma3:4b` (or any model your instance supports).
 2. Install the only dependency: `python3 -m pip install requests`.
-3. Run `python3 test_openwebui.py "Health check: say pong."` for a scripted verification, or `bash test_openwebui.sh` when you prefer shell tooling.
-4. Inspect the generated JSON artifact to confirm the assistant response and attach it to bug reports as needed.
+3. Automated path: run `python3 test_openwebui.py "Health check: say pong."` and review the generated `test_result_*.json` plus the chat/knowledge snapshots saved under `artifacts/`.
+4. Manual path: follow the copy/paste-ready curl itinerary in [`API_FLOW.md`](./API_FLOW.md) to exercise every endpoint yourself, inspect intermediate payloads, and open the emitted quick links to the chat and knowledge collection.
 
-## API Flow Reference
-The OpenWebUI backend expects the same data shape the web client produces. The harness shows the exact sequence; the outline below is safe to reuse in other tooling.
-
-1. **Create the chat** – `POST /api/v1/chats/new`
-   ```jsonc
-   {
-     "chat": {
-       "title": "Test Chat",
-       "models": ["gemma3:4b"],
-       "messages": [
-         {
-           "id": "<user-id>",
-           "role": "user",
-           "content": "Health check: say pong.",
-           "timestamp": 1710000000,
-           "models": ["gemma3:4b"],
-           "parentId": null,
-           "childrenIds": []
-         }
-       ],
-       "history": {
-         "current_id": "<user-id>",
-         "messages": {
-           "<user-id>": {
-             "id": "<user-id>",
-             "role": "user",
-             "content": "Health check: say pong.",
-             "timestamp": 1710000000,
-             "models": ["gemma3:4b"],
-             "parentId": null,
-             "childrenIds": []
-           }
-         }
-       }
-     }
-   }
-   ```
-
-2. **Insert an assistant placeholder** – enrich the response locally and `POST /api/v1/chats/{chat_id}` with:
-   - An empty assistant message in both `chat.messages[]` and `chat.history.messages{}`.
-   - `parentId` set to the user message ID.
-   - `done: false`, `childrenIds: []`, and the parent’s `childrenIds` updated to include the assistant ID.
-
-3. **Trigger the completion** – `POST /api/chat/completions` with:
-   ```jsonc
-   {
-     "chat_id": "<chat-id>",
-     "id": "<assistant-id>",
-     "messages": [{"role": "user", "content": "Health check: say pong."}],
-     "model": "gemma3:4b",
-     "stream": false,
-     "background_tasks": {"title_generation": false, "tags_generation": false, "follow_up_generation": false},
-     "features": {"code_interpreter": false, "web_search": false, "image_generation": false, "memory": false},
-     "session_id": "<uuid>"
-   }
-   ```
-   The response usually contains `{ "status": true, "task_id": "..." }`. You can monitor active work with `GET /api/tasks/chat/<chat_id>`; if it ever lists IDs, the UI will keep showing the stop button.
-
-4. **Wait for the assistant content** – poll `GET /api/v1/chats/<chat_id>` until the assistant message in `messages[]` has non-empty `content`. If the text only turns up under `history.messages`, re‑post the enriched chat (Step 2) with `done: true` so both structures match.
-
-5. **Mark the completion** – `POST /api/chat/completed` with `{ "chat_id": "...", "id": "<assistant-id>", "session_id": "<uuid>", "model": "gemma3:4b" }` to clear the frontend spinner.
-
-6. *(Optional)* **Continue the chat** – subsequent turns reuse the same pattern: add a user message (update `childrenIds`), inject a blank assistant placeholder, trigger `/api/chat/completions`, and poll until the UI fields are populated.
-
-Always keep `messages[]` and `history.messages{}` in sync—especially `childrenIds`, `parentId`, and `done`. The web client relies on those fields to decide when to stop showing the spinner.
+## Manual API Flow
+If you need to understand or demonstrate every HTTP request, [`API_FLOW.md`](./API_FLOW.md) documents the entire sequence with placeholder-based curl examples and shell snippets that store each response to disk. It ends with quick links to the generated chat and knowledge collection so you can review them immediately in the browser.
 
 ## Extending the Workflow
 - Add new verification steps by following the existing `stepN_action` naming pattern so logs stay consistent.

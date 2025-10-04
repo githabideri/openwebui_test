@@ -3,5 +3,4 @@ test_result_*.json
 __pycache__/
 *.pyc
 artifacts/
-open-webui/
-docs/
+vendor/

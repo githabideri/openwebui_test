@@ -14,7 +14,9 @@ import time
 import uuid
 import os
 import sys
-from typing import Dict, Optional, Tuple, List
+import random
+import mimetypes
+from typing import Dict, Optional, Tuple, List, Any
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -45,10 +47,12 @@ class OpenWebUITester:
         self.model = model
         self.session_id = session_id
         self.session = requests.Session()
-        self.session.headers.update({
-            'Authorization': f'Bearer {token}',
-            'Content-Type': 'application/json'
-        })
+        self.session.headers.update(
+            {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+            }
+        )
         self.follow_up_enabled = os.getenv("FOLLOW_UP_TEST", "0") == "1"
         
     def _log(self, message: str, level: str = "INFO"):
@@ -71,24 +75,496 @@ class OpenWebUITester:
         
         print(f"{color}[{timestamp}] {symbol}{Colors.NC} {message}")
         
-    def _make_request(self, method: str, endpoint: str, data: Optional[Dict] = None) -> Dict:
+    def _make_request(
+        self,
+        method: str,
+        endpoint: str,
+        data: Optional[Dict] = None,
+        json_payload: Optional[Dict] = None,
+        headers: Optional[Dict[str, str]] = None,
+        files: Optional[Dict[str, Tuple[str, bytes, str]]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: float = 60.0,
+    ) -> Dict:
         """Make an HTTP request and return the JSON response."""
+
         url = f"{self.base_url}{endpoint}"
+        request_headers = dict(self.session.headers)
+        if headers:
+            request_headers.update(headers)
+
         try:
-            if method.upper() == "GET":
-                response = self.session.get(url)
-            elif method.upper() == "POST":
-                response = self.session.post(url, json=data)
+            method_upper = method.upper()
+            if method_upper == "GET":
+                response = self.session.get(
+                    url, headers=request_headers, params=params, timeout=timeout
+                )
+            elif method_upper == "POST":
+                if files:
+                    response = self.session.post(
+                        url,
+                        headers={k: v for k, v in request_headers.items() if k.lower() != "content-type"},
+                        files=files,
+                        data=data,
+                        params=params,
+                        timeout=timeout,
+                    )
+                elif json_payload is not None:
+                    response = self.session.post(
+                        url,
+                        headers=request_headers,
+                        json=json_payload,
+                        params=params,
+                        timeout=timeout,
+                    )
+                else:
+                    response = self.session.post(
+                        url,
+                        headers=request_headers,
+                        json=data,
+                        params=params,
+                        timeout=timeout,
+                    )
             else:
                 raise ValueError(f"Unsupported method: {method}")
-                
+
             response.raise_for_status()
-            return response.json()
+            if response.content:
+                return response.json()
+            return {}
         except requests.exceptions.RequestException as e:
             self._log(f"Request failed: {str(e)}", "ERROR")
-            if hasattr(e, 'response') and e.response is not None:
+            if hasattr(e, "response") and e.response is not None:
                 self._log(f"Response: {e.response.text[:500]}", "ERROR")
             raise
+
+    @staticmethod
+    def _extract_first_id(payload: Any) -> Optional[str]:
+        """Extract the first identifier found in a nested payload."""
+
+        if isinstance(payload, dict):
+            for key in ("id", "_id", "knowledge_id", "file_id"):
+                value = payload.get(key)
+                if value:
+                    return str(value)
+            for value in payload.values():
+                found = OpenWebUITester._extract_first_id(value)
+                if found:
+                    return found
+        elif isinstance(payload, list):
+            for item in payload:
+                found = OpenWebUITester._extract_first_id(item)
+                if found:
+                    return found
+        elif isinstance(payload, (str, int)):
+            return str(payload)
+        return None
+
+    def _upload_artifact_file(self, path: Path) -> Dict[str, Any]:
+        """Upload a local artifact to OpenWebUI and return metadata."""
+
+        mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        size_bytes = path.stat().st_size
+        self._log(
+            f"  Uploading {path.name} ({size_bytes} bytes, {mime_type})...",
+            "DETAIL",
+        )
+
+        endpoints = [
+            "/api/v1/files/",
+            "/api/v1/files",
+            "/api/v1/files/upload",
+        ]
+        params = {"process": "true", "process_in_background": "false"}
+        last_error: Optional[Exception] = None
+
+        for index, endpoint in enumerate(endpoints):
+            url = f"{self.base_url}{endpoint}"
+            try:
+                with path.open("rb") as handle:
+                    response = self.session.post(
+                        url,
+                        headers={
+                            k: v
+                            for k, v in self.session.headers.items()
+                            if k.lower() != "content-type"
+                        },
+                        files={"file": (path.name, handle, mime_type)},
+                        params=params,
+                        timeout=180,
+                    )
+                status_code = response.status_code
+                if status_code in (404, 405) and index < len(endpoints) - 1:
+                    self._log(
+                        f"    Endpoint {endpoint} unavailable ({status_code}); trying fallback",
+                        "DETAIL",
+                    )
+                    continue
+                if status_code >= 400:
+                    response.raise_for_status()
+                data = response.json() if response.content else {}
+                file_id = self._extract_first_id(data)
+                if not file_id:
+                    raise RuntimeError("OpenWebUI upload did not return an id")
+                self._log(f"    File uploaded with id {file_id}", "SUCCESS")
+                return {
+                    "path": str(path),
+                    "id": file_id,
+                    "size": size_bytes,
+                    "mime_type": mime_type,
+                    "response": data,
+                }
+            except Exception as exc:
+                last_error = exc
+                self._log(f"    Upload attempt via {endpoint} failed: {exc}", "WARNING")
+
+        if last_error:
+            raise last_error
+        raise RuntimeError(f"Failed to upload artifact {path}")
+
+    def _wait_for_file_processing(
+        self,
+        file_id: str,
+        label: str,
+        timeout: float = 180.0,
+        poll_interval: float = 1.0,
+    ) -> Dict[str, Any]:
+        """Poll until OpenWebUI finishes processing an uploaded file."""
+
+        deadline = time.time() + timeout
+        last_status: Optional[str] = None
+        status_payload: Dict[str, Any] = {}
+
+        while time.time() < deadline:
+            try:
+                status_payload = self._make_request(
+                    "GET",
+                    f"/api/v1/files/{file_id}/process/status",
+                    timeout=30,
+                )
+            except Exception as exc:
+                self._log(
+                    f"    Could not fetch processing status for {label}: {exc}",
+                    "WARNING",
+                )
+                time.sleep(poll_interval)
+                continue
+
+            status = ""
+            if isinstance(status_payload, dict):
+                status = str(status_payload.get("status", ""))
+
+            if status and status != last_status:
+                self._log(
+                    f"    Processing status for {label}: {status}",
+                    "DETAIL",
+                )
+                last_status = status
+
+            if status.lower() == "completed":
+                try:
+                    file_details = self._make_request(
+                        "GET", f"/api/v1/files/{file_id}", timeout=30
+                    )
+                except Exception:
+                    file_details = {}
+                return {"status": status, "details": file_details}
+            if status.lower() == "failed":
+                raise RuntimeError(
+                    f"File {file_id} processing failed: {status_payload}"
+                )
+
+            time.sleep(poll_interval)
+
+        raise TimeoutError(
+            f"File {file_id} did not finish processing after {timeout} seconds"
+        )
+
+    def _create_knowledge_collection(self, name: str, description: str) -> Dict[str, Any]:
+        """Create an OpenWebUI knowledge collection and return metadata."""
+
+        endpoints = [
+            "/api/v1/knowledge/create",
+            "/api/v1/knowledge",
+        ]
+        payload = {"name": name, "description": description}
+        last_error: Optional[Exception] = None
+
+        for endpoint in endpoints:
+            url = f"{self.base_url}{endpoint}"
+            try:
+                response = self.session.post(url, json=payload, timeout=60)
+                if response.status_code >= 400:
+                    response.raise_for_status()
+                data = response.json() if response.content else {}
+                knowledge_id = self._extract_first_id(data)
+                if not knowledge_id:
+                    raise RuntimeError("Knowledge creation response did not include an id")
+                self._log(
+                    f"  Knowledge collection created with id {knowledge_id}", "SUCCESS"
+                )
+                data.setdefault("id", knowledge_id)
+                return data
+            except requests.exceptions.HTTPError as exc:
+                status = exc.response.status_code if exc.response else None
+                if status in (404, 405) and endpoint != endpoints[-1]:
+                    self._log(
+                        f"    Knowledge endpoint {endpoint} unavailable ({status}); retrying fallback",
+                        "DETAIL",
+                    )
+                    last_error = exc
+                    continue
+                raise
+            except Exception as exc:
+                last_error = exc
+                self._log(f"    Knowledge creation via {endpoint} failed: {exc}", "WARNING")
+
+        if last_error:
+            raise last_error
+        raise RuntimeError("Failed to create knowledge collection")
+
+    def _attach_files_to_knowledge(self, knowledge_id: str, file_ids: List[str]) -> None:
+        """Attach uploaded files to the target knowledge collection."""
+
+        endpoint = f"/api/v1/knowledge/{knowledge_id}/file/add"
+        url = f"{self.base_url}{endpoint}"
+        for file_id in file_ids:
+            payload = {"file_id": file_id}
+            retries = 5
+            for attempt in range(retries):
+                try:
+                    response = self.session.post(url, json=payload, timeout=60)
+                    if response.status_code >= 400:
+                        response.raise_for_status()
+                    self._log(
+                        f"    Attached file {file_id} to knowledge {knowledge_id}",
+                        "SUCCESS",
+                    )
+                    break
+                except requests.exceptions.HTTPError as exc:
+                    status = exc.response.status_code if exc.response else None
+                    if status in (409, 422, 425, 503) and attempt < retries - 1:
+                        wait = 0.4 + random.random() * 0.4
+                        self._log(
+                            f"    Attachment returned {status}; retrying in {wait:.2f}s",
+                            "WARNING",
+                        )
+                        time.sleep(wait)
+                        continue
+                    raise
+                except Exception as exc:
+                    if attempt < retries - 1:
+                        wait = 0.4 + random.random() * 0.4
+                        self._log(
+                            f"    Attachment error {exc}; retrying in {wait:.2f}s",
+                            "WARNING",
+                        )
+                        time.sleep(wait)
+                        continue
+                    raise
+
+    def step7_publish_artifacts(
+        self,
+        chat_id: str,
+        artifact_paths: List[Path],
+        user_message: str,
+        assistant_response: str,
+    ) -> Dict[str, Any]:
+        """Upload artifacts and bind them to a fresh knowledge collection."""
+
+        self._log("STEP 7: Publishing artifacts to OpenWebUI knowledge...", "INFO")
+
+        uploaded: List[Dict[str, Any]] = []
+        for path in artifact_paths:
+            upload_info = self._upload_artifact_file(path)
+            file_id = upload_info["id"]
+            processing_info = self._wait_for_file_processing(
+                file_id, label=path.name
+            )
+            upload_info["processing"] = processing_info
+            uploaded.append(upload_info)
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
+        name = f"OpenWebUI Test Artifacts {datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+        description = (
+            f"Automated test artifacts for chat {chat_id}. "
+            f"User prompt: {user_message[:180]}. Generated at {timestamp}."
+        )
+
+        knowledge_info = self._create_knowledge_collection(name, description)
+        knowledge_id = knowledge_info.get("id") or self._extract_first_id(knowledge_info)
+        if not knowledge_id:
+            raise RuntimeError("Knowledge creation succeeded but no id was captured")
+
+        file_ids = [entry["id"] for entry in uploaded]
+        self._attach_files_to_knowledge(knowledge_id, file_ids)
+
+        try:
+            knowledge_details = self._make_request(
+                "GET", f"/api/v1/knowledge/{knowledge_id}"
+            )
+        except Exception:
+            knowledge_details = {}
+
+        knowledge_snapshot_path = None
+        try:
+            artifacts_dir = Path("artifacts")
+            artifacts_dir.mkdir(exist_ok=True)
+            snapshot_path = artifacts_dir / f"knowledge_snapshot_{knowledge_id}.json"
+            with snapshot_path.open("w", encoding="utf-8") as handle:
+                json.dump(knowledge_details, handle, indent=2)
+                handle.write("\n")
+            knowledge_snapshot_path = snapshot_path
+        except Exception as exc:
+            self._log(
+                f"    Could not write knowledge snapshot: {exc}",
+                "WARNING",
+            )
+
+        ui_url = f"{self.base_url}/workspace/knowledge/{knowledge_id}"
+        api_url = f"{self.base_url}/api/v1/knowledge/{knowledge_id}"
+
+        self._log(
+            f"Knowledge collection ready for review: {ui_url}",
+            "SUCCESS",
+        )
+
+        updated_chat_state = self._bind_knowledge_to_chat(
+            chat_id, knowledge_id, knowledge_details or knowledge_info
+        )
+
+        return {
+            "knowledge_id": knowledge_id,
+            "knowledge_name": knowledge_info.get("name", name),
+            "knowledge_api_url": api_url,
+            "knowledge_ui_url": ui_url,
+            "uploads": uploaded,
+            "knowledge_details": knowledge_details,
+            "knowledge_snapshot": str(knowledge_snapshot_path)
+            if knowledge_snapshot_path
+            else None,
+            "chat": updated_chat_state,
+            "assistant_response": assistant_response,
+        }
+
+    def _bind_knowledge_to_chat(
+        self,
+        chat_id: str,
+        knowledge_id: str,
+        knowledge_details: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Link the created knowledge collection to the chat for immediate use."""
+
+        try:
+            raw_chat = self._make_request("GET", f"/api/v1/chats/{chat_id}")
+        except Exception as exc:
+            self._log(f"    Could not read chat while binding knowledge: {exc}", "WARNING")
+            return None
+
+        working_chat = (
+            json.loads(json.dumps(raw_chat.get("chat")))
+            if isinstance(raw_chat, dict) and isinstance(raw_chat.get("chat"), dict)
+            else json.loads(json.dumps(raw_chat))
+            if isinstance(raw_chat, dict)
+            else None
+        )
+
+        if not isinstance(working_chat, dict):
+            self._log("    Chat payload missing or malformed; skipping knowledge link", "WARNING")
+            return None
+
+        working_chat.setdefault("id", chat_id)
+
+        knowledge_entry: Dict[str, Any] = {"id": knowledge_id}
+        if isinstance(knowledge_details, dict):
+            knowledge_entry.update(json.loads(json.dumps(knowledge_details)))
+        knowledge_entry.setdefault("id", knowledge_id)
+        knowledge_entry.setdefault("type", "collection")
+        knowledge_entry.setdefault("status", knowledge_entry.get("status", "processed"))
+
+        def merge_entry(collection: List[Dict[str, Any]], entry: Dict[str, Any]) -> List[Dict[str, Any]]:
+            merged: List[Dict[str, Any]] = []
+            seen: set[str] = set()
+            for existing in collection + [entry]:
+                if not isinstance(existing, dict):
+                    continue
+                entry_id = str(existing.get("id")) if existing.get("id") else None
+                if not entry_id or entry_id in seen:
+                    continue
+                seen.add(entry_id)
+                merged.append(existing)
+            return merged
+
+        files = working_chat.setdefault("files", [])
+        if isinstance(files, list):
+            working_chat["files"] = merge_entry(files, knowledge_entry)
+        else:
+            working_chat["files"] = [knowledge_entry]
+
+        knowledge_ids = working_chat.setdefault("knowledge_ids", [])
+        if isinstance(knowledge_ids, list):
+            knowledge_ids.append(knowledge_id)
+            ordered = []
+            for kid in knowledge_ids:
+                if kid not in ordered:
+                    ordered.append(kid)
+            working_chat["knowledge_ids"] = ordered
+        else:
+            working_chat["knowledge_ids"] = [knowledge_id]
+
+        for message in working_chat.get("messages", []) or []:
+            if isinstance(message, dict) and message.get("role") == "user":
+                existing_files = message.setdefault("files", [])
+                if isinstance(existing_files, list):
+                    message["files"] = merge_entry(existing_files, knowledge_entry)
+                else:
+                    message["files"] = [knowledge_entry]
+                break
+
+        history = working_chat.get("history")
+        if isinstance(history, dict):
+            history_messages = history.setdefault("messages", {})
+            if isinstance(history_messages, dict):
+                for msg in history_messages.values():
+                    if isinstance(msg, dict) and msg.get("role") == "user":
+                        existing_files = msg.setdefault("files", [])
+                        if isinstance(existing_files, list):
+                            msg["files"] = merge_entry(existing_files, knowledge_entry)
+                        else:
+                            msg["files"] = [knowledge_entry]
+                        break
+
+        payload = {"chat": working_chat}
+
+        try:
+            self._make_request(
+                "POST",
+                f"/api/v1/chats/{chat_id}",
+                json_payload=payload,
+                timeout=60,
+            )
+            self._log(
+                f"  Knowledge collection linked to chat {chat_id}",
+                "SUCCESS",
+            )
+            try:
+                refreshed = self._make_request("GET", f"/api/v1/chats/{chat_id}")
+                if (
+                    isinstance(refreshed, dict)
+                    and isinstance(refreshed.get("chat"), dict)
+                ):
+                    return refreshed["chat"]
+                if isinstance(refreshed, dict):
+                    return refreshed
+            except Exception:
+                pass
+        except Exception as exc:
+            self._log(
+                f"    Failed to link knowledge to chat: {exc}",
+                "WARNING",
+            )
+
+        return working_chat
 
     def _get_task_ids(self, chat_id: str) -> List[str]:
         """Fetch active task IDs for a chat."""
@@ -281,6 +757,121 @@ class OpenWebUITester:
         self._log(f"Chat snapshot saved to {snapshot_path}", "DETAIL")
         return snapshot_path
 
+    def step6_generate_test_artifacts(
+        self,
+        chat_id: str,
+        user_message: str,
+        assistant_response: str,
+    ) -> List[Path]:
+        """Create representative files that can be uploaded to OpenWebUI."""
+        self._log("STEP 6: Generating test artifacts for upload validation...")
+
+        artifacts_dir = Path("artifacts")
+        artifacts_dir.mkdir(exist_ok=True)
+
+        timestamp_utc = datetime.now(timezone.utc)
+        stamp = timestamp_utc.strftime("%Y%m%d_%H%M%S")
+        session_stub = self.session_id.split("-")[0]
+        prefix = f"openwebui_test_load_{stamp}_{session_stub}"
+
+        assistant_preview = (assistant_response or "").strip()
+        if len(assistant_preview) > 220:
+            assistant_preview = assistant_preview[:220] + "…"
+
+        iso_timestamp = timestamp_utc.isoformat()
+        txt_path = artifacts_dir / f"{prefix}.txt"
+        md_path = artifacts_dir / f"{prefix}.md"
+        json_path = artifacts_dir / f"{prefix}.json"
+
+        artifacts: List[Path] = []
+
+        txt_lines = [
+            "OpenWebUI verification test artifact",
+            f"Generated: {iso_timestamp}",
+            f"Base URL: {self.base_url}",
+            f"Model: {self.model}",
+            f"Chat ID: {chat_id}",
+            f"Session ID: {self.session_id}",
+            "",
+            "This plain-text payload is produced by the automated backend flow test.",
+            "Use it to confirm file uploads succeed within OpenWebUI.",
+            "",
+            "User message:",
+            user_message,
+        ]
+        if assistant_preview:
+            txt_lines.extend([
+                "",
+                "Assistant reply preview:",
+                assistant_preview,
+            ])
+        txt_path.write_text("\n".join(txt_lines) + "\n", encoding="utf-8")
+        artifacts.append(txt_path)
+        self._log(
+            f"  Created text artifact: {txt_path} ({txt_path.stat().st_size} bytes)",
+            "SUCCESS",
+        )
+
+        md_lines = [
+            "# OpenWebUI Test Artifact",
+            "",
+            f"- **Generated**: {iso_timestamp}",
+            f"- **Base URL**: {self.base_url}",
+            f"- **Model**: {self.model}",
+            f"- **Chat ID**: {chat_id}",
+            f"- **Session ID**: {self.session_id}",
+            "",
+            "## Scenario",
+            "This Markdown file accompanies automated regression checks. Attach it to a knowledge collection to validate uploads.",
+            "",
+            "### User Prompt",
+            "```",
+            user_message,
+            "```",
+            "",
+        ]
+        if assistant_preview:
+            md_lines.extend([
+                "### Assistant Reply Preview",
+                "```",
+                assistant_preview,
+                "```",
+            ])
+        else:
+            md_lines.extend([
+                "### Assistant Reply Preview",
+                "_Not captured during this run._",
+            ])
+        md_content = "\n".join(md_lines) + "\n"
+        md_path.write_text(md_content, encoding="utf-8")
+        artifacts.append(md_path)
+        self._log(
+            f"  Created markdown artifact: {md_path} ({md_path.stat().st_size} bytes)",
+            "SUCCESS",
+        )
+
+        json_payload = {
+            "artifact": "openwebui-test",
+            "generated_at": iso_timestamp,
+            "session_id": self.session_id,
+            "chat_id": chat_id,
+            "model": self.model,
+            "user_message": user_message,
+            "assistant_preview": assistant_preview,
+            "notes": "Use this JSON payload to exercise knowledge uploads in OpenWebUI.",
+        }
+        with json_path.open("w", encoding="utf-8") as handle:
+            json.dump(json_payload, handle, indent=2)
+            handle.write("\n")
+        artifacts.append(json_path)
+        self._log(
+            f"  Created JSON artifact: {json_path} ({json_path.stat().st_size} bytes)",
+            "SUCCESS",
+        )
+
+        self._log("Test artifacts ready in ./artifacts", "DETAIL")
+        return artifacts
+
     def step1_create_chat(self, user_message: str) -> Dict:
         """Step 1: Create a new chat with a user message."""
         self._log("STEP 1: Creating chat...")
@@ -468,7 +1059,9 @@ class OpenWebUITester:
             "session_id": self.session_id
         }
             
-        result = self._make_request("POST", "/api/chat/completions", payload)
+        result = self._make_request(
+            "POST", "/api/chat/completions", payload, timeout=180
+        )
         preview = json.dumps(result, indent=2)[:400] if isinstance(result, dict) else str(result)[:400]
         self._log(f"Completion response preview: {preview}", "DETAIL")
 
@@ -750,14 +1343,14 @@ class OpenWebUITester:
             
             # Step 6: Verify spinner is gone
             verification_passed, final_chat = self.verify_spinner_gone(chat_id, assistant_msg_id)
-            
+
             if not verification_passed:
                 return {
                     "success": False,
                     "error": "Spinner verification failed",
                     "chat_id": chat_id
                 }
-            
+
             # Extract response
             if not assistant_response:
                 for msg in final_chat.get("messages", []):
@@ -774,6 +1367,25 @@ class OpenWebUITester:
 
             assistant_response = assistant_response or ""
 
+            artifact_paths = self.step6_generate_test_artifacts(
+                chat_id=chat_id,
+                user_message=user_message,
+                assistant_response=assistant_response,
+            )
+
+            if not artifact_paths:
+                raise RuntimeError("No artifacts were generated for upload validation")
+
+            publish_result = self.step7_publish_artifacts(
+                chat_id=chat_id,
+                artifact_paths=artifact_paths,
+                user_message=user_message,
+                assistant_response=assistant_response,
+            )
+
+            if isinstance(publish_result.get("chat"), dict):
+                final_chat = publish_result["chat"]
+
             # Display results
             print()
             self._log("="*80)
@@ -785,12 +1397,38 @@ class OpenWebUITester:
             print()
             print(assistant_response)
             print()
-            
+
             self._log("Access your chat here:", "DETAIL")
             print(f"  {self.base_url}/c/{chat_id}")
             print()
 
             self._save_chat_snapshot(chat_id)
+
+            self._log("Artifacts generated for manual upload checks:", "DETAIL")
+            for artifact in artifact_paths:
+                self._log(f"  {artifact}", "DETAIL")
+            self._log("Uploaded to knowledge collection:", "DETAIL")
+            self._log(
+                f"  Collection: {publish_result.get('knowledge_name')} "
+                f"({publish_result.get('knowledge_id')})",
+                "DETAIL",
+            )
+            self._log(f"  API: {publish_result.get('knowledge_api_url')}", "DETAIL")
+            self._log(f"  UI:  {publish_result.get('knowledge_ui_url')}", "DETAIL")
+            snapshot_path = publish_result.get("knowledge_snapshot")
+            if snapshot_path:
+                self._log(f"  Snapshot: {snapshot_path}", "DETAIL")
+            for item in publish_result.get("uploads", []):
+                status = (
+                    item.get("processing", {}).get("status")
+                    if isinstance(item.get("processing"), dict)
+                    else None
+                )
+                self._log(
+                    f"    ↳ {item.get('path')} → file_id={item.get('id')}"
+                    + (f" (status: {status})" if status else ""),
+                    "DETAIL",
+                )
 
             # Optional: Test if chat is continuable
             if self.follow_up_enabled:
@@ -806,7 +1444,10 @@ class OpenWebUITester:
                 "assistant_response": assistant_response,
                 "full_chat": final_chat,
                 "spinner_gone": True,
-                "continuable": True
+                "continuable": True,
+                "artifacts": [str(path) for path in artifact_paths],
+                "artifact_count": len(artifact_paths),
+                "knowledge": publish_result,
             }
             
         except Exception as e:
