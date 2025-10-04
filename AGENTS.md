@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 - `test_openwebui.py` houses the `OpenWebUITester`; extend the flow by adding `stepN_action` methods so logs stay chronological and reusable.
-- `test_openwebui.sh` mirrors the Python sequence for cron/CI; keep helper functions lowercase_snake_case and return non-zero on failure to bubble errors.
+- Manual reproduction steps live in `API_FLOW.md`—keep them in sync with the Python flow when adding or reordering steps.
 - Store `.env` beside the scripts with `BASE`, `TOKEN`, `MODEL` (no trailing slash on `BASE`); keep it out of Git.
 - JSON transcripts (`test_result_YYYYMMDD_HHMMSS.json`) are saved in the repo root; archive or purge them once tickets are filed.
 
@@ -10,7 +10,7 @@
 - `python3 -m pip install requests` installs the only dependency required for fresh environments.
 - `python3 test_openwebui.py "Health check: say pong."` runs the canonical verification and emits a transcript file on success.
 - `python3 test_openwebui.py "Custom prompt"` reuses the workflow for scenario-specific regression checks.
-- `bash test_openwebui.sh` exercises the same steps without Python state and is optimized for containers or cron jobs.
+- Manual spot checks: copy/paste the curl itinerary in `API_FLOW.md` to verify payload shapes against a live instance.
 
 ## Coding Style & Naming Conventions
 - Follow Python 3.10 conventions already present: four-space indent, type hints, docstrings, and f-strings for logging.

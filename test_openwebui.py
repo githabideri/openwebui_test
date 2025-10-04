@@ -4,10 +4,11 @@ OpenWebUI Backend Flow Test Script with .env Support
 This script tests the complete workflow and verifies the spinner is gone.
 
 Usage:
-    python openwebui_test.py
-    python openwebui_test.py "Custom test message"
+    python test_openwebui.py "Custom test message"
+    python test_openwebui.py --no-pong "Seed chat without assistant reply"
 """
 
+import argparse
 import requests
 import json
 import time
@@ -21,6 +22,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+SCRIPT_VERSION = "0.1.1"
+
+
 class Colors:
     """ANSI color codes for terminal output"""
     BLUE = '\033[0;34m'
@@ -32,7 +36,14 @@ class Colors:
 
 
 class OpenWebUITester:
-    def __init__(self, base_url: str, token: str, model: str, session_id: str):
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        model: str,
+        session_id: str,
+        generate_response: bool = True,
+    ):
         """
         Initialize the OpenWebUI tester.
         
@@ -41,11 +52,13 @@ class OpenWebUITester:
             token: API authentication token
             model: Model name to use
             session_id: Session ID for this test run
+            generate_response: Whether to request a model completion
         """
         self.base_url = base_url.rstrip('/')
         self.token = token
         self.model = model
         self.session_id = session_id
+        self.generate_response = generate_response
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -54,6 +67,7 @@ class OpenWebUITester:
             }
         )
         self.follow_up_enabled = os.getenv("FOLLOW_UP_TEST", "0") == "1"
+        self.prefill_only = not generate_response
         
     def _log(self, message: str, level: str = "INFO"):
         """Log a message with timestamp and color."""
@@ -1005,6 +1019,87 @@ class OpenWebUITester:
         self._log("Assistant placeholder injected", "SUCCESS")
 
         return assistant_msg_id, updated_chat
+
+    def step3_finalize_prefill_chat(
+        self,
+        chat_id: str,
+        user_msg_id: str,
+        assistant_msg_id: str,
+        chat_state: Dict,
+    ) -> Dict:
+        """Step 3: Finalize chat without requesting a completion."""
+        self._log("STEP 3: Skipping completion request (prefill-only mode)...")
+
+        self._log("  Finalizing placeholder so the UI is unlocked...", "DETAIL")
+        try:
+            self._mark_completion(chat_id, assistant_msg_id)
+        except Exception as exc:
+            self._log(
+                f"  Could not confirm completion marker: {exc}",
+                "WARNING",
+            )
+
+        updated_chat = json.loads(json.dumps(chat_state))
+        messages = updated_chat.get("messages") or []
+        filtered_messages: List[Dict[str, Any]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            if message.get("id") == assistant_msg_id:
+                continue
+            children = message.get("childrenIds")
+            if isinstance(children, list):
+                message["childrenIds"] = [
+                    child for child in children if child != assistant_msg_id
+                ]
+            filtered_messages.append(message)
+        updated_chat["messages"] = filtered_messages
+
+        history = updated_chat.setdefault("history", {})
+        history_messages = history.setdefault("messages", {})
+        if isinstance(history_messages, dict) and assistant_msg_id in history_messages:
+            history_messages.pop(assistant_msg_id, None)
+        for entry in history_messages.values():
+            if isinstance(entry, dict):
+                children = entry.get("childrenIds")
+                if isinstance(children, list) and assistant_msg_id in children:
+                    entry["childrenIds"] = [
+                        child for child in children if child != assistant_msg_id
+                    ]
+
+        history["current_id"] = user_msg_id
+        history["currentId"] = user_msg_id
+        updated_chat["currentId"] = user_msg_id
+
+        if isinstance(history_messages, dict):
+            user_entry = history_messages.get(user_msg_id)
+            if isinstance(user_entry, dict):
+                user_entry["done"] = True
+                user_entry.setdefault("statusHistory", [])
+
+        for message in updated_chat.get("messages", []) or []:
+            if isinstance(message, dict) and message.get("id") == user_msg_id:
+                message["done"] = True
+                message.setdefault("statusHistory", [])
+                break
+        updated_chat["id"] = chat_id
+
+        self._make_request("POST", f"/api/v1/chats/{chat_id}", {"chat": updated_chat})
+        self._log(
+            "Chat updated without assistant output; ready for user input.",
+            "SUCCESS",
+        )
+
+        tasks_after = self._get_task_ids(chat_id)
+        if tasks_after:
+            self._log(
+                "  Warning: background tasks still reported after cleanup: "
+                + ", ".join(tasks_after),
+                "WARNING",
+            )
+        else:
+            self._log("  No active tasks remain for this chat.", "DETAIL")
+        return updated_chat
         
     def step3_trigger_completion(
         self,
@@ -1080,18 +1175,23 @@ class OpenWebUITester:
 
         return chat_state, assistant_text
         
-    def step4_mark_completion(self, chat_id: str, assistant_msg_id: str) -> None:
-        """Step 4: Mark the completion as done (CRITICAL - prevents spinner!)."""
-        self._log("STEP 4: Marking completion... (This prevents the spinner!)")
-        
+    def _mark_completion(self, chat_id: str, assistant_msg_id: str) -> None:
+        """Notify OpenWebUI that the assistant turn is complete."""
+
         payload = {
             "chat_id": chat_id,
             "id": assistant_msg_id,
             "session_id": self.session_id,
-            "model": self.model
+            "model": self.model,
         }
-        
+
         self._make_request("POST", "/api/chat/completed", payload)
+
+    def step4_mark_completion(self, chat_id: str, assistant_msg_id: str) -> None:
+        """Step 4: Mark the completion as done (CRITICAL - prevents spinner!)."""
+        self._log("STEP 4: Marking completion... (This prevents the spinner!)")
+
+        self._mark_completion(chat_id, assistant_msg_id)
         self._log("Completion marked (spinner should not appear!)", "SUCCESS")
         
     def step5_poll_for_response(self, chat_id: str, assistant_msg_id: str, 
@@ -1245,7 +1345,11 @@ class OpenWebUITester:
         
         return True, chat_data
         
-    def test_chat_continuable(self, chat_id: str, assistant_msg_id: str) -> bool:
+    def test_chat_continuable(
+        self,
+        chat_id: str,
+        assistant_msg_id: Optional[str],
+    ) -> bool:
         """Test if chat is continuable by attempting to add a follow-up message."""
         self._log("Testing if chat is continuable by adding a follow-up message...", "DETAIL")
         
@@ -1257,11 +1361,23 @@ class OpenWebUITester:
             chat_state = response_payload.get("chat") if isinstance(response_payload, dict) and isinstance(response_payload.get("chat"), dict) else response_payload
             updated_chat = json.loads(json.dumps(chat_state))
 
+            parent_id = assistant_msg_id
+            if not parent_id:
+                parent_id = chat_state.get("currentId") or chat_state.get("current_id")
+            if not parent_id:
+                messages = chat_state.get("messages", []) or []
+                if messages and isinstance(messages[-1], dict):
+                    parent_id = messages[-1].get("id")
+
+            if not parent_id:
+                self._log("No assistant message id available for follow-up", "WARNING")
+                return False
+
             user_message = {
                 "id": followup_user_id,
                 "role": "user",
                 "content": "Thanks! One more test.",
-                "parentId": assistant_msg_id,
+                "parentId": parent_id,
                 "timestamp": timestamp,
                 "models": [self.model]
             }
@@ -1297,13 +1413,15 @@ class OpenWebUITester:
             Dict containing test results
         """
         self._log("="*80)
-        self._log("OpenWebUI Backend Flow Test with Spinner Verification")
+        self._log(f"OpenWebUI Backend Flow Test v{SCRIPT_VERSION} with Spinner Verification")
         self._log("="*80)
         print()
         
         self._log("Test Configuration:", "DETAIL")
         self._log(f"  Message: {user_message}", "DETAIL")
         self._log(f"  Session ID: {self.session_id}", "DETAIL")
+        mode_label = "full completion" if self.generate_response else "prefill only"
+        self._log(f"  Mode: {mode_label}", "DETAIL")
         print()
         
         try:
@@ -1320,52 +1438,63 @@ class OpenWebUITester:
             )
             print()
             
-            # Step 3: Trigger completion
             assistant_response = ""
-            chat_state, assistant_response = self.step3_trigger_completion(
-                chat_id,
-                assistant_msg_id,
-                user_message,
-                chat_state,
-            )
-            print()
-            
-            # Small delay before marking complete
-            time.sleep(2)
-            
-            # Step 4: Mark completion (CRITICAL!)
-            self.step4_mark_completion(chat_id, assistant_msg_id)
-            print()
-            
-            # Step 5: Poll for response
-            chat_data = self.step5_poll_for_response(chat_id, assistant_msg_id)
-            print()
-            
-            # Step 6: Verify spinner is gone
-            verification_passed, final_chat = self.verify_spinner_gone(chat_id, assistant_msg_id)
+            if self.generate_response:
+                # Step 3: Trigger completion
+                chat_state, assistant_response = self.step3_trigger_completion(
+                    chat_id,
+                    assistant_msg_id,
+                    user_message,
+                    chat_state,
+                )
+                print()
 
-            if not verification_passed:
-                return {
-                    "success": False,
-                    "error": "Spinner verification failed",
-                    "chat_id": chat_id
-                }
+                # Small delay before marking complete
+                time.sleep(2)
 
-            # Extract response
-            if not assistant_response:
-                for msg in final_chat.get("messages", []):
-                    if msg.get("id") == assistant_msg_id:
-                        assistant_response = msg.get("content", "")
-                        break
+                # Step 4: Mark completion (CRITICAL!)
+                self.step4_mark_completion(chat_id, assistant_msg_id)
+                print()
 
-            if not assistant_response:
-                history_messages = final_chat.get("history", {}).get("messages", {})
-                if isinstance(history_messages, dict):
-                    history_msg = history_messages.get(assistant_msg_id)
-                    if isinstance(history_msg, dict):
-                        assistant_response = history_msg.get("content", "")
+                # Step 5: Poll for response
+                chat_data = self.step5_poll_for_response(chat_id, assistant_msg_id)
+                print()
 
-            assistant_response = assistant_response or ""
+                # Step 6: Verify spinner is gone
+                verification_passed, final_chat = self.verify_spinner_gone(chat_id, assistant_msg_id)
+
+                if not verification_passed:
+                    return {
+                        "success": False,
+                        "error": "Spinner verification failed",
+                        "chat_id": chat_id
+                    }
+
+                # Extract response
+                if not assistant_response:
+                    for msg in final_chat.get("messages", []):
+                        if msg.get("id") == assistant_msg_id:
+                            assistant_response = msg.get("content", "")
+                            break
+
+                if not assistant_response:
+                    history_messages = final_chat.get("history", {}).get("messages", {})
+                    if isinstance(history_messages, dict):
+                        history_msg = history_messages.get(assistant_msg_id)
+                        if isinstance(history_msg, dict):
+                            assistant_response = history_msg.get("content", "")
+
+                assistant_response = assistant_response or ""
+            else:
+                chat_state = self.step3_finalize_prefill_chat(
+                    chat_id,
+                    user_msg_id,
+                    assistant_msg_id,
+                    chat_state,
+                )
+                print()
+                final_chat = chat_state
+                verification_passed = True
 
             artifact_paths = self.step6_generate_test_artifacts(
                 chat_id=chat_id,
@@ -1395,7 +1524,10 @@ class OpenWebUITester:
             
             self._log("Assistant Response:", "DETAIL")
             print()
-            print(assistant_response)
+            if self.generate_response:
+                print(assistant_response)
+            else:
+                print("[no response requested]")
             print()
 
             self._log("Access your chat here:", "DETAIL")
@@ -1431,7 +1563,7 @@ class OpenWebUITester:
                 )
 
             # Optional: Test if chat is continuable
-            if self.follow_up_enabled:
+            if self.follow_up_enabled and self.generate_response:
                 print()
                 self.test_chat_continuable(chat_id, assistant_msg_id)
 
@@ -1439,15 +1571,17 @@ class OpenWebUITester:
                 "success": True,
                 "chat_id": chat_id,
                 "user_msg_id": user_msg_id,
-                "assistant_msg_id": assistant_msg_id,
+                "assistant_msg_id": assistant_msg_id if self.generate_response else None,
                 "user_message": user_message,
                 "assistant_response": assistant_response,
                 "full_chat": final_chat,
-                "spinner_gone": True,
+                "spinner_gone": verification_passed if self.generate_response else True,
                 "continuable": True,
                 "artifacts": [str(path) for path in artifact_paths],
                 "artifact_count": len(artifact_paths),
                 "knowledge": publish_result,
+                "prefill_only": not self.generate_response,
+                "version": SCRIPT_VERSION,
             }
             
         except Exception as e:
@@ -1457,7 +1591,9 @@ class OpenWebUITester:
             traceback.print_exc()
             return {
                 "success": False,
-                "error": str(e)
+                "error": str(e),
+                "version": SCRIPT_VERSION,
+                "prefill_only": not self.generate_response,
             }
 
 
@@ -1480,7 +1616,24 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
 
 def main():
     """Main function to run tests."""
-    
+    parser = argparse.ArgumentParser(
+        description="OpenWebUI backend flow tester",
+    )
+    parser.add_argument(
+        "message",
+        nargs="?",
+        default="Health check: say pong.",
+        help="Prompt to seed the chat (default: Health check: say pong.)",
+    )
+    parser.add_argument(
+        "--no-pong",
+        "--prefill-only",
+        dest="generate_response",
+        action="store_false",
+        help="Skip requesting a completion; create a prefilled chat without an assistant reply.",
+    )
+    args = parser.parse_args()
+
     # Find .env file in script directory
     script_dir = Path(__file__).parent
     env_file = script_dir / '.env'
@@ -1517,14 +1670,11 @@ def main():
     print(f"  SESSION: {SESSION}")
     print()
     
-    # Get test message from command line or use default
-    test_message = sys.argv[1] if len(sys.argv) > 1 else "Health check: say pong."
-    
     # Initialize tester
-    tester = OpenWebUITester(BASE, TOKEN, MODEL, SESSION)
+    tester = OpenWebUITester(BASE, TOKEN, MODEL, SESSION, generate_response=args.generate_response)
     
     # Run test
-    result = tester.run_complete_test(test_message)
+    result = tester.run_complete_test(args.message)
     
     # Save results to file
     if result.get("success"):
