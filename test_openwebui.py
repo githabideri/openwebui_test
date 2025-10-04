@@ -487,14 +487,20 @@ class OpenWebUITester:
 
             if history_content.strip():
                 self._log("History contains assistant content; synchronizing messages", "DETAIL")
-                chat_view = self._sync_assistant_content(chat_id, chat_view, assistant_msg_id, history_content)
-                messages = chat_view.get("messages", [])
-                for message in messages:
-                    if (message.get("id") == assistant_msg_id and
-                            message.get("role") == "assistant" and
-                            (message.get("content", "") or "").strip()):
-                        self._log(f"Response ready after {attempt + 1} attempts", "SUCCESS")
-                        return chat_view
+                synced_view = self._sync_assistant_content(chat_id, chat_view, assistant_msg_id, history_content)
+                if isinstance(synced_view, dict):
+                    chat_view = synced_view
+                    messages = chat_view.get("messages", []) or []
+                    for message in messages:
+                        if (
+                            message.get("id") == assistant_msg_id
+                            and message.get("role") == "assistant"
+                            and (message.get("content", "") or "").strip()
+                        ):
+                            self._log(f"Response ready after {attempt + 1} attempts", "SUCCESS")
+                            return chat_view
+                else:
+                    self._log("Content sync returned unexpected payload", "WARNING")
             
             self._log(f"  Attempt {attempt + 1}/{max_attempts}: Waiting for response...")
             time.sleep(interval)
