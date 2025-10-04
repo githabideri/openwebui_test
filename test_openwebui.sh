@@ -300,25 +300,29 @@ run_complete_test() {
                 \"models\": [\"$MODEL\"],
                 \"messages\": [
                     {
-                        \"id\": \"$USER_MSG_ID\",
-                        \"role\": \"user\",
-                        \"content\": \"$TEST_MESSAGE\",
-                        \"timestamp\": $TIMESTAMP,
-                        \"models\": [\"$MODEL\"]
-                    }
-                ],
-                \"history\": {
-                    \"current_id\": \"$USER_MSG_ID\",
-                    \"messages\": {
-                        \"$USER_MSG_ID\": {
-                            \"id\": \"$USER_MSG_ID\",
-                            \"role\": \"user\",
-                            \"content\": \"$TEST_MESSAGE\",
-                            \"timestamp\": $TIMESTAMP,
-                            \"models\": [\"$MODEL\"]
-                        }
-                    }
+                \"id\": \"$USER_MSG_ID\",
+                \"role\": \"user\",
+                \"content\": \"$TEST_MESSAGE\",
+                \"timestamp\": $TIMESTAMP,
+                \"models\": [\"$MODEL\"],
+                \"parentId\": null,
+                \"childrenIds\": []
+            }
+        ],
+        \"history\": {
+            \"current_id\": \"$USER_MSG_ID\",
+            \"messages\": {
+                \"$USER_MSG_ID\": {
+                    \"id\": \"$USER_MSG_ID\",
+                    \"role\": \"user\",
+                    \"content\": \"$TEST_MESSAGE\",
+                    \"timestamp\": $TIMESTAMP,
+                    \"models\": [\"$MODEL\"],
+                    \"parentId\": null,
+                    \"childrenIds\": []
                 }
+            }
+        }
             }
         }")
     
@@ -353,17 +357,23 @@ run_complete_test() {
             modelIdx: 0,
             timestamp: $timestamp,
             done: false,
-            statusHistory: []
+            statusHistory: [],
+            childrenIds: []
         }'
     )
 
     local UPDATED_CHAT=$(echo "$CHAT_JSON" | jq \
         --argjson assistant "$ASSISTANT_MESSAGE" \
         --arg id "$ASSISTANT_MSG_ID" \
-        '.messages = (.messages // []) + [$assistant]
+        --arg user "$USER_MSG_ID" \
+        '.messages = ((.messages // [])
+            | map(if .id == $user then (. + {childrenIds: ((.childrenIds // []) + [$id] | unique)}) else . end)
+          ) + [$assistant]
          | .history = (.history // {})
          | .history.messages = (.history.messages // {})
          | .history.messages[$id] = $assistant
+         | .history.messages[$user] = ((.history.messages[$user] // {})
+            | . + {childrenIds: ((.childrenIds // []) + [$id] | unique)})
          | .history.current_id = $id
          | .history.currentId = $id
          | .currentId = $id'

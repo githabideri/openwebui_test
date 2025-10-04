@@ -183,22 +183,6 @@ class OpenWebUITester:
         if not content or not content.strip():
             return chat_view
 
-    def _save_chat_snapshot(self, chat_id: str) -> Optional[Path]:
-        """Persist the latest chat payload for external inspection."""
-        try:
-            chat_payload = self._make_request("GET", f"/api/v1/chats/{chat_id}")
-        except Exception as exc:
-            self._log(f"Unable to capture chat snapshot: {exc}", "WARNING")
-            return None
-
-        artifacts_dir = Path("artifacts")
-        artifacts_dir.mkdir(exist_ok=True)
-        snapshot_path = artifacts_dir / f"chat_snapshot_{chat_id}.json"
-        with snapshot_path.open("w", encoding="utf-8") as handle:
-            json.dump(chat_payload, handle, indent=2)
-        self._log(f"Chat snapshot saved to {snapshot_path}", "DETAIL")
-        return snapshot_path
-
         updated_chat = json.loads(json.dumps(chat_view))
         updated_chat["id"] = chat_id
 
@@ -219,12 +203,23 @@ class OpenWebUITester:
                 "modelIdx": 0,
                 "timestamp": int(time.time()),
                 "done": True,
+                "childrenIds": [],
             }
             messages.append(assistant_entry)
         else:
             assistant_entry["content"] = content
             assistant_entry["done"] = True
             assistant_entry.setdefault("statusHistory", [])
+            assistant_entry.setdefault("childrenIds", [])
+
+        parent_id = assistant_entry.get("parentId")
+        if parent_id:
+            for message in messages:
+                if message.get("id") == parent_id:
+                    children = message.setdefault("childrenIds", [])
+                    if assistant_msg_id not in children:
+                        children.append(assistant_msg_id)
+                    break
 
         history = updated_chat.setdefault("history", {})
         history_messages = history.setdefault("messages", {})
@@ -237,10 +232,20 @@ class OpenWebUITester:
                 "modelName": assistant_entry.get("modelName", self.model),
                 "modelIdx": assistant_entry.get("modelIdx", 0),
                 "timestamp": assistant_entry.get("timestamp", int(time.time())),
+                "childrenIds": [],
             }
         history_entry["content"] = content
         history_entry["done"] = True
+        history_entry.setdefault("childrenIds", [])
         history_messages[assistant_msg_id] = history_entry
+
+        if parent_id:
+            parent_history = history_messages.get(parent_id)
+            if isinstance(parent_history, dict):
+                children = parent_history.setdefault("childrenIds", [])
+                if assistant_msg_id not in children:
+                    children.append(assistant_msg_id)
+
         history["current_id"] = assistant_msg_id
         history["currentId"] = assistant_msg_id
         updated_chat["currentId"] = assistant_msg_id
@@ -260,6 +265,22 @@ class OpenWebUITester:
             self._log(f"Failed to synchronize assistant content: {sync_error}", "WARNING")
             return chat_view
 
+    def _save_chat_snapshot(self, chat_id: str) -> Optional[Path]:
+        """Persist the latest chat payload for external inspection."""
+        try:
+            chat_payload = self._make_request("GET", f"/api/v1/chats/{chat_id}")
+        except Exception as exc:
+            self._log(f"Unable to capture chat snapshot: {exc}", "WARNING")
+            return None
+
+        artifacts_dir = Path("artifacts")
+        artifacts_dir.mkdir(exist_ok=True)
+        snapshot_path = artifacts_dir / f"chat_snapshot_{chat_id}.json"
+        with snapshot_path.open("w", encoding="utf-8") as handle:
+            json.dump(chat_payload, handle, indent=2)
+        self._log(f"Chat snapshot saved to {snapshot_path}", "DETAIL")
+        return snapshot_path
+
     def step1_create_chat(self, user_message: str) -> Dict:
         """Step 1: Create a new chat with a user message."""
         self._log("STEP 1: Creating chat...")
@@ -277,7 +298,9 @@ class OpenWebUITester:
                         "role": "user",
                         "content": user_message,
                         "timestamp": timestamp,
-                        "models": [self.model]
+                        "models": [self.model],
+                        "parentId": None,
+                        "childrenIds": [],
                     }
                 ],
                 "history": {
@@ -288,7 +311,9 @@ class OpenWebUITester:
                             "role": "user",
                             "content": user_message,
                             "timestamp": timestamp,
-                            "models": [self.model]
+                            "models": [self.model],
+                            "parentId": None,
+                            "childrenIds": [],
                         }
                     }
                 }
@@ -357,15 +382,28 @@ class OpenWebUITester:
             "timestamp": timestamp,
             "done": False,
             "statusHistory": [],
+            "childrenIds": [],
         }
 
         updated_chat = json.loads(json.dumps(chat_payload))
         messages = updated_chat.setdefault("messages", [])
         messages.append(assistant_message)
 
+        for message in messages:
+            if message.get("id") == user_msg_id:
+                children = message.setdefault("childrenIds", [])
+                if assistant_msg_id not in children:
+                    children.append(assistant_msg_id)
+                break
+
         history = updated_chat.setdefault("history", {})
         history_messages = history.setdefault("messages", {})
         history_messages[assistant_msg_id] = dict(assistant_message)
+        parent_entry = history_messages.get(user_msg_id)
+        if isinstance(parent_entry, dict):
+            children = parent_entry.setdefault("childrenIds", [])
+            if assistant_msg_id not in children:
+                children.append(assistant_msg_id)
         history["current_id"] = assistant_msg_id
         history["currentId"] = assistant_msg_id
 
