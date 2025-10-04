@@ -49,6 +49,7 @@ class OpenWebUITester:
             'Authorization': f'Bearer {token}',
             'Content-Type': 'application/json'
         })
+        self.follow_up_enabled = os.getenv("FOLLOW_UP_TEST", "0") == "1"
         
     def _log(self, message: str, level: str = "INFO"):
         """Log a message with timestamp and color."""
@@ -728,8 +729,9 @@ class OpenWebUITester:
             self._save_chat_snapshot(chat_id)
 
             # Optional: Test if chat is continuable
-            print()
-            self.test_chat_continuable(chat_id, assistant_msg_id)
+            if self.follow_up_enabled:
+                print()
+                self.test_chat_continuable(chat_id, assistant_msg_id)
 
             return {
                 "success": True,

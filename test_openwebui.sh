@@ -628,8 +628,10 @@ run_complete_test() {
         info "Chat snapshot saved to artifacts/chat_snapshot_${CHAT_ID}.json"
 
         # Optional: Test if chat is continuable
-        echo ""
-        test_chat_continuable "$CHAT_ID" "$ASSISTANT_MSG_ID" || true
+        if [ "${FOLLOW_UP_TEST:-0}" = "1" ]; then
+            echo ""
+            test_chat_continuable "$CHAT_ID" "$ASSISTANT_MSG_ID" || true
+        fi
         
         return 0
     else
