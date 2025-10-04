@@ -90,6 +90,18 @@ class OpenWebUITester:
                 self._log(f"Response: {e.response.text[:500]}", "ERROR")
             raise
 
+    def _get_task_ids(self, chat_id: str) -> List[str]:
+        """Fetch active task IDs for a chat."""
+        try:
+            result = self._make_request("GET", f"/api/tasks/chat/{chat_id}")
+            task_ids = result.get("task_ids") if isinstance(result, dict) else []
+            if not isinstance(task_ids, list):
+                return []
+            return [str(task) for task in task_ids]
+        except Exception as exc:
+            self._log(f"Could not retrieve task list: {exc}", "WARNING")
+            return []
+
     def _extract_assistant_text(self, completion_result: Dict) -> str:
         """Extract assistant content from the completion response."""
         if not isinstance(completion_result, dict):
@@ -234,7 +246,14 @@ class OpenWebUITester:
         updated_chat["currentId"] = assistant_msg_id
 
         try:
-            self._make_request("POST", f"/api/v1/chats/{chat_id}", {"chat": updated_chat})
+            response = self._make_request("POST", f"/api/v1/chats/{chat_id}", {"chat": updated_chat})
+            preview = json.dumps(response, indent=2)[:200] if isinstance(response, dict) else str(response)[:200]
+            self._log(f"Chat update response: {preview}", "DETAIL")
+            if isinstance(response, dict):
+                updated_payload = response.get("chat")
+                if isinstance(updated_payload, dict):
+                    updated_payload.setdefault("history", {}).setdefault("messages", {})
+                    return updated_payload
             self._log("Assistant content synchronized with chat state", "DETAIL")
             return updated_chat
         except Exception as sync_error:
@@ -450,6 +469,12 @@ class OpenWebUITester:
         self._log(f"STEP 5: Polling for response (max {max_attempts} attempts, {interval}s interval)...")
         
         for attempt in range(max_attempts):
+            task_ids = self._get_task_ids(chat_id)
+            if task_ids:
+                self._log(f"  Active tasks: {', '.join(task_ids)}", "DETAIL")
+            else:
+                self._log("  No active tasks reported", "DETAIL")
+
             chat_data = self._make_request("GET", f"/api/v1/chats/{chat_id}")
             chat_view = chat_data.get("chat") if isinstance(chat_data, dict) and isinstance(chat_data.get("chat"), dict) else chat_data
             if not isinstance(chat_view, dict):
@@ -505,7 +530,8 @@ class OpenWebUITester:
             
             self._log(f"  Attempt {attempt + 1}/{max_attempts}: Waiting for response...")
             time.sleep(interval)
-            
+        self._log("Polling timed out; capturing final chat snapshot for analysis", "WARNING")
+        self._save_chat_snapshot(chat_id)
         raise TimeoutError(f"Response not ready after {max_attempts} attempts")
         
     def verify_spinner_gone(self, chat_id: str, assistant_msg_id: str) -> Tuple[bool, Dict]:
