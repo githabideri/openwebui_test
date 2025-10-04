@@ -620,7 +620,13 @@ run_complete_test() {
         info "Access your chat here:"
         echo "  $BASE/c/$CHAT_ID"
         echo ""
-        
+
+        mkdir -p artifacts
+        curl -s -X GET "$BASE/api/v1/chats/$CHAT_ID" \
+            -H "Authorization: Bearer $TOKEN" \
+            -o "artifacts/chat_snapshot_${CHAT_ID}.json"
+        info "Chat snapshot saved to artifacts/chat_snapshot_${CHAT_ID}.json"
+
         # Optional: Test if chat is continuable
         echo ""
         test_chat_continuable "$CHAT_ID" "$ASSISTANT_MSG_ID" || true

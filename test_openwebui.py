@@ -170,6 +170,22 @@ class OpenWebUITester:
         if not content or not content.strip():
             return chat_view
 
+    def _save_chat_snapshot(self, chat_id: str) -> Optional[Path]:
+        """Persist the latest chat payload for external inspection."""
+        try:
+            chat_payload = self._make_request("GET", f"/api/v1/chats/{chat_id}")
+        except Exception as exc:
+            self._log(f"Unable to capture chat snapshot: {exc}", "WARNING")
+            return None
+
+        artifacts_dir = Path("artifacts")
+        artifacts_dir.mkdir(exist_ok=True)
+        snapshot_path = artifacts_dir / f"chat_snapshot_{chat_id}.json"
+        with snapshot_path.open("w", encoding="utf-8") as handle:
+            json.dump(chat_payload, handle, indent=2)
+        self._log(f"Chat snapshot saved to {snapshot_path}", "DETAIL")
+        return snapshot_path
+
         updated_chat = json.loads(json.dumps(chat_view))
         updated_chat["id"] = chat_id
 
@@ -702,11 +718,13 @@ class OpenWebUITester:
             self._log("Access your chat here:", "DETAIL")
             print(f"  {self.base_url}/c/{chat_id}")
             print()
-            
+
+            self._save_chat_snapshot(chat_id)
+
             # Optional: Test if chat is continuable
             print()
             self.test_chat_continuable(chat_id, assistant_msg_id)
-            
+
             return {
                 "success": True,
                 "chat_id": chat_id,
