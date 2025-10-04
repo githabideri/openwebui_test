@@ -19,6 +19,72 @@ This repository demonstrates how to script OpenWebUI's REST APIs to create full 
 3. Run `python3 test_openwebui.py "Health check: say pong."` for a scripted verification, or `bash test_openwebui.sh` when you prefer shell tooling.
 4. Inspect the generated JSON artifact to confirm the assistant response and attach it to bug reports as needed.
 
+## API Flow Reference
+The OpenWebUI backend expects the same data shape the web client produces. The harness shows the exact sequence; the outline below is safe to reuse in other tooling.
+
+1. **Create the chat** – `POST /api/v1/chats/new`
+   ```jsonc
+   {
+     "chat": {
+       "title": "Test Chat",
+       "models": ["gemma3:4b"],
+       "messages": [
+         {
+           "id": "<user-id>",
+           "role": "user",
+           "content": "Health check: say pong.",
+           "timestamp": 1710000000,
+           "models": ["gemma3:4b"],
+           "parentId": null,
+           "childrenIds": []
+         }
+       ],
+       "history": {
+         "current_id": "<user-id>",
+         "messages": {
+           "<user-id>": {
+             "id": "<user-id>",
+             "role": "user",
+             "content": "Health check: say pong.",
+             "timestamp": 1710000000,
+             "models": ["gemma3:4b"],
+             "parentId": null,
+             "childrenIds": []
+           }
+         }
+       }
+     }
+   }
+   ```
+
+2. **Insert an assistant placeholder** – enrich the response locally and `POST /api/v1/chats/{chat_id}` with:
+   - An empty assistant message in both `chat.messages[]` and `chat.history.messages{}`.
+   - `parentId` set to the user message ID.
+   - `done: false`, `childrenIds: []`, and the parent’s `childrenIds` updated to include the assistant ID.
+
+3. **Trigger the completion** – `POST /api/chat/completions` with:
+   ```jsonc
+   {
+     "chat_id": "<chat-id>",
+     "id": "<assistant-id>",
+     "messages": [{"role": "user", "content": "Health check: say pong."}],
+     "model": "gemma3:4b",
+     "stream": false,
+     "background_tasks": {"title_generation": false, "tags_generation": false, "follow_up_generation": false},
+     "features": {"code_interpreter": false, "web_search": false, "image_generation": false, "memory": false},
+     "session_id": "<uuid>"
+   }
+   ```
+   The response usually contains `{ "status": true, "task_id": "..." }`. You can monitor active work with `GET /api/tasks/chat/<chat_id>`; if it ever lists IDs, the UI will keep showing the stop button.
+
+4. **Wait for the assistant content** – poll `GET /api/v1/chats/<chat_id>` until the assistant message in `messages[]` has non-empty `content`. If the text only turns up under `history.messages`, re‑post the enriched chat (Step 2) with `done: true` so both structures match.
+
+5. **Mark the completion** – `POST /api/chat/completed` with `{ "chat_id": "...", "id": "<assistant-id>", "session_id": "<uuid>", "model": "gemma3:4b" }` to clear the frontend spinner.
+
+6. *(Optional)* **Continue the chat** – subsequent turns reuse the same pattern: add a user message (update `childrenIds`), inject a blank assistant placeholder, trigger `/api/chat/completions`, and poll until the UI fields are populated.
+
+Always keep `messages[]` and `history.messages{}` in sync—especially `childrenIds`, `parentId`, and `done`. The web client relies on those fields to decide when to stop showing the spinner.
+
 ## Extending the Workflow
 - Add new verification steps by following the existing `stepN_action` naming pattern so logs stay consistent.
 - When testing new OpenWebUI builds, duplicate transcripts to compare payload changes between versions.
