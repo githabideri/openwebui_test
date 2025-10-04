@@ -1,3 +1,8 @@
+# Preface
+I wanted to create chat sessions (with attachments) in OpenWebUI from the CLI via API calls as outlined [here]([url](https://docs.openwebui.com/tutorials/integrations/backend-controlled-ui-compatible-flow/)). But it did not work out, I was not able to get it fully working, the chat window in OpenWebUI would constantly show a spinner and saying "Loading...". That's why I created this repo and I tried out how LLMs (from OpenAI, Anthropic and a bit of unsuccessful Google) in their new CLI variants could handle it. GPT-Codex was ultimately able to crack the nut, but only after I gave it git cloned open-webui/open-webui and open-webui/docs and more importantly two json exports from OpenWebUI itself, one broken chat (via API call) and one working (manually). OpenWebUI allows you to download chats not only in text and PDF but also in json - That's great! And then it was able to figure it out. The following is the result and summarization of my endavour. Maybe useful to somebody :)
+
+Tested with OpenWebUI v6.32.
+
 # OpenWebUI API Verification
 
 This repository demonstrates how to script OpenWebUI's REST APIs to create full chat sessions, capture the returned artifacts, and validate that conversations remain usable after automation. It ships both Python and Bash harnesses so teams can embed the same workflow in their preferred tooling without manual UI steps.
