@@ -2,5 +2,6 @@
 test_result_*.json
 __pycache__/
 *.pyc
-artifacts/
+artifacts/*
+!artifacts/README.md
 vendor/

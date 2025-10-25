@@ -20,9 +20,10 @@ import mimetypes
 from typing import Dict, Optional, Tuple, List, Any
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 
-SCRIPT_VERSION = "0.1.1"
+SCRIPT_VERSION = "0.2.0"
 
 
 class Colors:
@@ -43,6 +44,12 @@ class OpenWebUITester:
         model: str,
         session_id: str,
         generate_response: bool = True,
+        output_root: Optional[Path] = None,
+        flat_output: bool = False,
+        tag: Optional[str] = None,
+        follow_up_override: Optional[bool] = None,
+        poll_interval: Optional[float] = None,
+        poll_attempts: Optional[int] = None,
     ):
         """
         Initialize the OpenWebUI tester.
@@ -66,9 +73,71 @@ class OpenWebUITester:
                 "Accept": "application/json",
             }
         )
-        self.follow_up_enabled = os.getenv("FOLLOW_UP_TEST", "0") == "1"
+        self.output_root = Path(output_root or "artifacts")
+        self.output_root.mkdir(parents=True, exist_ok=True)
+        self.flat_output = flat_output
+        self.tag = tag
+        self.run_directory: Optional[Path] = None
+        self.run_started_at: Optional[datetime] = None
+        self.run_completed_at: Optional[datetime] = None
+        self.run_id: Optional[str] = None
+        env_follow_up = os.getenv("FOLLOW_UP_TEST", "0") == "1"
+        self.follow_up_enabled = (
+            follow_up_override if follow_up_override is not None else env_follow_up
+        )
         self.prefill_only = not generate_response
-        
+        parsed_url = urlparse(self.base_url)
+        self.base_host = parsed_url.netloc or self.base_url
+        self.artifact_paths: List[Path] = []
+        self.poll_interval = poll_interval if poll_interval is not None else 1.0
+        if self.poll_interval <= 0:
+            self.poll_interval = 0.1
+        self.poll_attempts = int(poll_attempts) if poll_attempts is not None else 30
+        if self.poll_attempts <= 0:
+            self.poll_attempts = 1
+
+    def _initialize_run_state(self) -> None:
+        """Establish timestamps and output directories for this execution."""
+        if self.run_started_at is not None:
+            return
+
+        now = datetime.now(timezone.utc)
+        self.run_started_at = now
+        self.run_id = now.strftime("%Y%m%d_%H%M%S")
+
+        if not self.flat_output:
+            runs_dir = self.output_root / "runs"
+            runs_dir.mkdir(parents=True, exist_ok=True)
+            self.run_directory = runs_dir / self.run_id
+            self.run_directory.mkdir(parents=True, exist_ok=True)
+
+    def _get_run_directory(self) -> Path:
+        """Return the directory that should contain per-run artifacts."""
+        if self.run_started_at is None:
+            self._initialize_run_state()
+
+        if self.flat_output:
+            return self.output_root
+
+        if self.run_directory is None:
+            raise RuntimeError("Run directory not initialized")
+
+        return self.run_directory
+
+    def _ensure_category_dir(self, category: str) -> Path:
+        """Return a directory for shared artifacts (chat/knowledge snapshots)."""
+        if self.flat_output:
+            target = self.output_root
+        else:
+            target = self.output_root / category
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
+    def _record_artifact(self, path: Path) -> None:
+        """Track artifacts generated during this run for reporting."""
+        if path not in self.artifact_paths:
+            self.artifact_paths.append(path)
+
     def _log(self, message: str, level: str = "INFO"):
         """Log a message with timestamp and color."""
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -404,6 +473,8 @@ class OpenWebUITester:
             f"Automated test artifacts for chat {chat_id}. "
             f"User prompt: {user_message[:180]}. Generated at {timestamp}."
         )
+        if self.tag:
+            description += f" Tag: {self.tag}."
 
         knowledge_info = self._create_knowledge_collection(name, description)
         knowledge_id = knowledge_info.get("id") or self._extract_first_id(knowledge_info)
@@ -422,13 +493,13 @@ class OpenWebUITester:
 
         knowledge_snapshot_path = None
         try:
-            artifacts_dir = Path("artifacts")
-            artifacts_dir.mkdir(exist_ok=True)
-            snapshot_path = artifacts_dir / f"knowledge_snapshot_{knowledge_id}.json"
+            snapshot_dir = self._ensure_category_dir("knowledge_snapshots")
+            snapshot_path = snapshot_dir / f"knowledge_snapshot_{knowledge_id}.json"
             with snapshot_path.open("w", encoding="utf-8") as handle:
                 json.dump(knowledge_details, handle, indent=2)
                 handle.write("\n")
             knowledge_snapshot_path = snapshot_path
+            self._record_artifact(snapshot_path)
         except Exception as exc:
             self._log(
                 f"    Could not write knowledge snapshot: {exc}",
@@ -459,6 +530,7 @@ class OpenWebUITester:
             else None,
             "chat": updated_chat_state,
             "assistant_response": assistant_response,
+            "tag": self.tag,
         }
 
     def _bind_knowledge_to_chat(
@@ -762,13 +834,12 @@ class OpenWebUITester:
         except Exception as exc:
             self._log(f"Unable to capture chat snapshot: {exc}", "WARNING")
             return None
-
-        artifacts_dir = Path("artifacts")
-        artifacts_dir.mkdir(exist_ok=True)
-        snapshot_path = artifacts_dir / f"chat_snapshot_{chat_id}.json"
+        snapshot_dir = self._ensure_category_dir("chat_snapshots")
+        snapshot_path = snapshot_dir / f"chat_snapshot_{chat_id}.json"
         with snapshot_path.open("w", encoding="utf-8") as handle:
             json.dump(chat_payload, handle, indent=2)
         self._log(f"Chat snapshot saved to {snapshot_path}", "DETAIL")
+        self._record_artifact(snapshot_path)
         return snapshot_path
 
     def step6_generate_test_artifacts(
@@ -780,11 +851,11 @@ class OpenWebUITester:
         """Create representative files that can be uploaded to OpenWebUI."""
         self._log("STEP 6: Generating test artifacts for upload validation...")
 
-        artifacts_dir = Path("artifacts")
-        artifacts_dir.mkdir(exist_ok=True)
+        self._initialize_run_state()
+        artifacts_dir = self._get_run_directory()
 
         timestamp_utc = datetime.now(timezone.utc)
-        stamp = timestamp_utc.strftime("%Y%m%d_%H%M%S")
+        stamp = self.run_id or timestamp_utc.strftime("%Y%m%d_%H%M%S")
         session_stub = self.session_id.split("-")[0]
         prefix = f"openwebui_test_load_{stamp}_{session_stub}"
 
@@ -806,6 +877,7 @@ class OpenWebUITester:
             f"Model: {self.model}",
             f"Chat ID: {chat_id}",
             f"Session ID: {self.session_id}",
+            f"Run ID: {stamp}",
             "",
             "This plain-text payload is produced by the automated backend flow test.",
             "Use it to confirm file uploads succeed within OpenWebUI.",
@@ -813,6 +885,9 @@ class OpenWebUITester:
             "User message:",
             user_message,
         ]
+        if self.tag:
+            insertion_index = 7 if len(txt_lines) > 7 else len(txt_lines)
+            txt_lines.insert(insertion_index, f"Tag: {self.tag}")
         if assistant_preview:
             txt_lines.extend([
                 "",
@@ -821,6 +896,7 @@ class OpenWebUITester:
             ])
         txt_path.write_text("\n".join(txt_lines) + "\n", encoding="utf-8")
         artifacts.append(txt_path)
+        self._record_artifact(txt_path)
         self._log(
             f"  Created text artifact: {txt_path} ({txt_path.stat().st_size} bytes)",
             "SUCCESS",
@@ -834,6 +910,11 @@ class OpenWebUITester:
             f"- **Model**: {self.model}",
             f"- **Chat ID**: {chat_id}",
             f"- **Session ID**: {self.session_id}",
+            f"- **Run ID**: {stamp}",
+        ]
+        if self.tag:
+            md_lines.append(f"- **Tag**: {self.tag}")
+        md_lines.extend([
             "",
             "## Scenario",
             "This Markdown file accompanies automated regression checks. Attach it to a knowledge collection to validate uploads.",
@@ -843,7 +924,7 @@ class OpenWebUITester:
             user_message,
             "```",
             "",
-        ]
+        ])
         if assistant_preview:
             md_lines.extend([
                 "### Assistant Reply Preview",
@@ -859,6 +940,7 @@ class OpenWebUITester:
         md_content = "\n".join(md_lines) + "\n"
         md_path.write_text(md_content, encoding="utf-8")
         artifacts.append(md_path)
+        self._record_artifact(md_path)
         self._log(
             f"  Created markdown artifact: {md_path} ({md_path.stat().st_size} bytes)",
             "SUCCESS",
@@ -878,12 +960,13 @@ class OpenWebUITester:
             json.dump(json_payload, handle, indent=2)
             handle.write("\n")
         artifacts.append(json_path)
+        self._record_artifact(json_path)
         self._log(
             f"  Created JSON artifact: {json_path} ({json_path.stat().st_size} bytes)",
             "SUCCESS",
         )
 
-        self._log("Test artifacts ready in ./artifacts", "DETAIL")
+        self._log(f"Test artifacts ready in {artifacts_dir}", "DETAIL")
         return artifacts
 
     def step1_create_chat(self, user_message: str) -> Dict:
@@ -1194,12 +1277,21 @@ class OpenWebUITester:
         self._mark_completion(chat_id, assistant_msg_id)
         self._log("Completion marked (spinner should not appear!)", "SUCCESS")
         
-    def step5_poll_for_response(self, chat_id: str, assistant_msg_id: str, 
-                                max_attempts: int = 30, interval: int = 2) -> Dict:
+    def step5_poll_for_response(
+        self,
+        chat_id: str,
+        assistant_msg_id: str,
+        max_attempts: Optional[int] = None,
+        interval: Optional[float] = None,
+    ) -> Dict:
         """Step 5: Poll for assistant response readiness."""
-        self._log(f"STEP 5: Polling for response (max {max_attempts} attempts, {interval}s interval)...")
+        attempts = max_attempts if max_attempts is not None else self.poll_attempts
+        wait_interval = interval if interval is not None else self.poll_interval
+        self._log(
+            f"STEP 5: Polling for response (max {attempts} attempts, {wait_interval:.2f}s interval)..."
+        )
         
-        for attempt in range(max_attempts):
+        for attempt in range(attempts):
             task_ids = self._get_task_ids(chat_id)
             if task_ids:
                 self._log(f"  Active tasks: {', '.join(task_ids)}", "DETAIL")
@@ -1211,7 +1303,7 @@ class OpenWebUITester:
             if not isinstance(chat_view, dict):
                 self._log("Unexpected chat payload structure while polling", "WARNING")
                 self._log(f"Payload preview: {str(chat_data)[:300]}", "DETAIL")
-                time.sleep(interval)
+                time.sleep(wait_interval)
                 continue
             if attempt == 0:
                 try:
@@ -1259,11 +1351,11 @@ class OpenWebUITester:
                 else:
                     self._log("Content sync returned unexpected payload", "WARNING")
             
-            self._log(f"  Attempt {attempt + 1}/{max_attempts}: Waiting for response...")
-            time.sleep(interval)
+            self._log(f"  Attempt {attempt + 1}/{attempts}: Waiting for response...")
+            time.sleep(wait_interval)
         self._log("Polling timed out; capturing final chat snapshot for analysis", "WARNING")
         self._save_chat_snapshot(chat_id)
-        raise TimeoutError(f"Response not ready after {max_attempts} attempts")
+        raise TimeoutError(f"Response not ready after {attempts} attempts")
         
     def verify_spinner_gone(self, chat_id: str, assistant_msg_id: str) -> Tuple[bool, Dict]:
         """
@@ -1412,6 +1504,8 @@ class OpenWebUITester:
         Returns:
             Dict containing test results
         """
+        self.artifact_paths = []
+        self._initialize_run_state()
         self._log("="*80)
         self._log(f"OpenWebUI Backend Flow Test v{SCRIPT_VERSION} with Spinner Verification")
         self._log("="*80)
@@ -1420,10 +1514,19 @@ class OpenWebUITester:
         self._log("Test Configuration:", "DETAIL")
         self._log(f"  Message: {user_message}", "DETAIL")
         self._log(f"  Session ID: {self.session_id}", "DETAIL")
+        self._log(f"  Run ID: {self.run_id}", "DETAIL")
         mode_label = "full completion" if self.generate_response else "prefill only"
         self._log(f"  Mode: {mode_label}", "DETAIL")
+        if self.tag:
+            self._log(f"  Tag: {self.tag}", "DETAIL")
+        self._log(f"  Output root: {self.output_root}", "DETAIL")
+        structure_label = "flat" if self.flat_output else "structured"
+        self._log(f"  Output mode: {structure_label}", "DETAIL")
         print()
         
+        chat_snapshot_path: Optional[Path] = None
+        knowledge_snapshot_path: Optional[str] = None
+
         try:
             # Step 1: Create chat
             step1_result = self.step1_create_chat(user_message)
@@ -1534,7 +1637,7 @@ class OpenWebUITester:
             print(f"  {self.base_url}/c/{chat_id}")
             print()
 
-            self._save_chat_snapshot(chat_id)
+            chat_snapshot_path = self._save_chat_snapshot(chat_id)
 
             self._log("Artifacts generated for manual upload checks:", "DETAIL")
             for artifact in artifact_paths:
@@ -1547,9 +1650,9 @@ class OpenWebUITester:
             )
             self._log(f"  API: {publish_result.get('knowledge_api_url')}", "DETAIL")
             self._log(f"  UI:  {publish_result.get('knowledge_ui_url')}", "DETAIL")
-            snapshot_path = publish_result.get("knowledge_snapshot")
-            if snapshot_path:
-                self._log(f"  Snapshot: {snapshot_path}", "DETAIL")
+            knowledge_snapshot_path = publish_result.get("knowledge_snapshot")
+            if knowledge_snapshot_path:
+                self._log(f"  Snapshot: {knowledge_snapshot_path}", "DETAIL")
             for item in publish_result.get("uploads", []):
                 status = (
                     item.get("processing", {}).get("status")
@@ -1567,6 +1670,27 @@ class OpenWebUITester:
                 print()
                 self.test_chat_continuable(chat_id, assistant_msg_id)
 
+            self.run_completed_at = datetime.now(timezone.utc)
+            duration_seconds = None
+            if self.run_started_at and self.run_completed_at:
+                duration_seconds = (
+                    self.run_completed_at - self.run_started_at
+                ).total_seconds()
+            artifact_root = str(self._get_run_directory())
+            run_directory = str(self.run_directory) if self.run_directory else None
+            artifacts_for_upload = [str(path) for path in artifact_paths]
+            recorded_artifacts = [str(path) for path in self.artifact_paths]
+            started_iso = (
+                self.run_started_at.isoformat() if self.run_started_at else None
+            )
+            completed_iso = (
+                self.run_completed_at.isoformat()
+                if self.run_completed_at
+                else None
+            )
+            knowledge_ui_url = publish_result.get("knowledge_ui_url")
+            knowledge_api_url = publish_result.get("knowledge_api_url")
+
             return {
                 "success": True,
                 "chat_id": chat_id,
@@ -1577,11 +1701,34 @@ class OpenWebUITester:
                 "full_chat": final_chat,
                 "spinner_gone": verification_passed if self.generate_response else True,
                 "continuable": True,
-                "artifacts": [str(path) for path in artifact_paths],
+                "artifacts": artifacts_for_upload,
                 "artifact_count": len(artifact_paths),
                 "knowledge": publish_result,
                 "prefill_only": not self.generate_response,
                 "version": SCRIPT_VERSION,
+                "run_id": self.run_id,
+                "run_directory": run_directory,
+                "artifact_root": artifact_root,
+                "recorded_artifacts": recorded_artifacts,
+                "started_at": started_iso,
+                "completed_at": completed_iso,
+                "duration_seconds": duration_seconds,
+                "base_url": self.base_url,
+                "base_host": self.base_host,
+                "model": self.model,
+                "session_id": self.session_id,
+                "tag": self.tag,
+                "follow_up_enabled": self.follow_up_enabled,
+                "generate_response": self.generate_response,
+                "flat_output": self.flat_output,
+                "poll_interval": self.poll_interval,
+                "poll_attempts": self.poll_attempts,
+                "output_root": str(self.output_root),
+                "output_mode": "flat" if self.flat_output else "structured",
+                "chat_snapshot": str(chat_snapshot_path) if chat_snapshot_path else None,
+                "knowledge_snapshot": knowledge_snapshot_path,
+                "knowledge_ui_url": knowledge_ui_url,
+                "knowledge_api_url": knowledge_api_url,
             }
             
         except Exception as e:
@@ -1589,11 +1736,58 @@ class OpenWebUITester:
             self._log("="*80)
             import traceback
             traceback.print_exc()
+            self.run_completed_at = datetime.now(timezone.utc)
+            duration_seconds = None
+            if self.run_started_at and self.run_completed_at:
+                duration_seconds = (
+                    self.run_completed_at - self.run_started_at
+                ).total_seconds()
+            try:
+                artifact_root = str(self._get_run_directory())
+            except Exception:
+                artifact_root = str(self.output_root)
+            run_directory = str(self.run_directory) if self.run_directory else None
+            recorded_artifacts = [str(path) for path in self.artifact_paths]
+            started_iso = (
+                self.run_started_at.isoformat() if self.run_started_at else None
+            )
+            completed_iso = (
+                self.run_completed_at.isoformat()
+                if self.run_completed_at
+                else None
+            )
+
             return {
                 "success": False,
                 "error": str(e),
                 "version": SCRIPT_VERSION,
                 "prefill_only": not self.generate_response,
+                "run_id": self.run_id,
+                "run_directory": run_directory,
+                "artifact_root": artifact_root,
+                "recorded_artifacts": recorded_artifacts,
+                "started_at": started_iso,
+                "completed_at": completed_iso,
+                "duration_seconds": duration_seconds,
+                "base_url": self.base_url,
+                "base_host": self.base_host,
+                "model": self.model,
+                "session_id": self.session_id,
+                "tag": self.tag,
+                "follow_up_enabled": self.follow_up_enabled,
+                "generate_response": self.generate_response,
+                "flat_output": self.flat_output,
+                "poll_interval": self.poll_interval,
+                "poll_attempts": self.poll_attempts,
+                "output_root": str(self.output_root),
+                "output_mode": "flat" if self.flat_output else "structured",
+                "artifacts": recorded_artifacts,
+                "artifact_count": len(self.artifact_paths),
+                "knowledge": None,
+                "knowledge_snapshot": knowledge_snapshot_path,
+                "chat_snapshot": str(chat_snapshot_path) if chat_snapshot_path else None,
+                "knowledge_ui_url": None,
+                "knowledge_api_url": None,
             }
 
 
@@ -1626,11 +1820,67 @@ def main():
         help="Prompt to seed the chat (default: Health check: say pong.)",
     )
     parser.add_argument(
+        "-P",
         "--no-pong",
         "--prefill-only",
         dest="generate_response",
         action="store_false",
+        default=True,
         help="Skip requesting a completion; create a prefilled chat without an assistant reply.",
+    )
+    parser.add_argument(
+        "-F",
+        "--follow-up",
+        dest="follow_up",
+        action="store_true",
+        default=None,
+        help="Force a follow-up prompt after the main run (overrides FOLLOW_UP_TEST env).",
+    )
+    parser.add_argument(
+        "-t",
+        "--tag",
+        dest="tag",
+        help="Optional label recorded in artifacts and metadata (e.g., staging, ticket ID).",
+    )
+    parser.add_argument(
+        "-M",
+        "--no-metadata",
+        dest="write_metadata",
+        action="store_false",
+        default=True,
+        help="Skip writing metadata.json alongside the test result.",
+    )
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        dest="output_dir",
+        type=Path,
+        default=Path("artifacts"),
+        help="Root directory for generated artifacts (default: ./artifacts).",
+    )
+    parser.add_argument(
+        "-f",
+        "--flat-output",
+        dest="flat_output",
+        action="store_true",
+        default=False,
+        help="Keep legacy flat layout (drop files in current directory instead of runs/<timestamp>/).",
+    )
+    parser.add_argument(
+        "-i",
+        "--poll-interval",
+        dest="poll_interval",
+        type=float,
+        default=None,
+        help="Seconds between poll attempts (default: 1.0).",
+    )
+    parser.add_argument(
+        "-a",
+        "--poll-attempts",
+        dest="poll_attempts",
+        type=int,
+        default=None,
+        help="Maximum poll attempts before timing out (default: 30).",
     )
     args = parser.parse_args()
 
@@ -1671,17 +1921,110 @@ def main():
     print()
     
     # Initialize tester
-    tester = OpenWebUITester(BASE, TOKEN, MODEL, SESSION, generate_response=args.generate_response)
+    output_root = args.output_dir if isinstance(args.output_dir, Path) else Path(args.output_dir)
+    follow_up_override = True if args.follow_up else None
+    tester = OpenWebUITester(
+        BASE,
+        TOKEN,
+        MODEL,
+        SESSION,
+        generate_response=args.generate_response,
+        output_root=output_root,
+        flat_output=args.flat_output,
+        tag=args.tag,
+        follow_up_override=follow_up_override,
+        poll_interval=args.poll_interval,
+        poll_attempts=args.poll_attempts,
+    )
     
     # Run test
     result = tester.run_complete_test(args.message)
     
     # Save results to file
     if result.get("success"):
-        output_file = f"test_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        with open(output_file, 'w') as f:
+        run_id = result.get("run_id") or datetime.now().strftime("%Y%m%d_%H%M%S")
+        if args.flat_output:
+            result_dir_path = Path(".")
+        else:
+            if result.get("run_directory"):
+                result_dir_path = Path(result["run_directory"])
+            elif tester.run_directory:
+                result_dir_path = tester.run_directory
+            else:
+                result_dir_path = output_root / "runs" / run_id
+                result_dir_path.mkdir(parents=True, exist_ok=True)
+        output_file_path = result_dir_path / f"test_result_{run_id}.json"
+        output_file_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_file_path.open("w", encoding="utf-8") as f:
             json.dump(result, f, indent=2)
-        print(f"\n{Colors.GREEN}✓{Colors.NC} Full test results saved to: {output_file}\n")
+            f.write("\n")
+        print(f"\n{Colors.GREEN}✓{Colors.NC} Full test results saved to: {output_file_path}\n")
+
+        if args.write_metadata:
+            knowledge = result.get("knowledge") or {}
+            metadata_path = result_dir_path / "metadata.json"
+            metadata = {
+                "run_id": run_id,
+                "script_version": result.get("version"),
+                "success": result.get("success"),
+                "chat_id": result.get("chat_id"),
+                "message": result.get("user_message"),
+                "assistant_response_preview": (result.get("assistant_response") or "")[:200],
+                "prefill_only": result.get("prefill_only"),
+                "generate_response": result.get("generate_response"),
+                "follow_up_enabled": result.get("follow_up_enabled"),
+                "spinner_gone": result.get("spinner_gone"),
+                "continuable": result.get("continuable"),
+                "tag": result.get("tag"),
+                "timing": {
+                    "started_at": result.get("started_at"),
+                    "completed_at": result.get("completed_at"),
+                    "duration_seconds": result.get("duration_seconds"),
+                },
+                "polling": {
+                    "interval_seconds": result.get("poll_interval"),
+                    "max_attempts": result.get("poll_attempts"),
+                },
+                "environment": {
+                    "base_url": result.get("base_url"),
+                    "base_host": result.get("base_host"),
+                    "model": result.get("model"),
+                    "session_id": result.get("session_id"),
+                    "tag": result.get("tag"),
+                },
+                "output": {
+                    "mode": result.get("output_mode"),
+                    "root": result.get("output_root"),
+                    "run_directory": result.get("run_directory"),
+                    "artifact_root": result.get("artifact_root"),
+                    "flat_output": args.flat_output,
+                    "result_file": str(output_file_path),
+                },
+                "artifacts": {
+                    "upload_bundle": result.get("artifacts", []),
+                    "recorded": result.get("recorded_artifacts", []),
+                    "artifact_count": result.get("artifact_count"),
+                    "chat_snapshot": result.get("chat_snapshot"),
+                    "knowledge_snapshot": result.get("knowledge_snapshot"),
+                },
+                "knowledge": {
+                    "id": knowledge.get("knowledge_id"),
+                    "name": knowledge.get("knowledge_name"),
+                    "api_url": result.get("knowledge_api_url"),
+                    "ui_url": result.get("knowledge_ui_url"),
+                    "uploads": knowledge.get("uploads"),
+                },
+                "urls": {
+                    "chat": f"{result.get('base_url')}/c/{result.get('chat_id')}" if result.get("base_url") and result.get("chat_id") else None,
+                    "knowledge_ui": result.get("knowledge_ui_url"),
+                    "knowledge_api": result.get("knowledge_api_url"),
+                },
+            }
+            metadata_path.parent.mkdir(parents=True, exist_ok=True)
+            with metadata_path.open("w", encoding="utf-8") as handle:
+                json.dump(metadata, handle, indent=2)
+                handle.write("\n")
+            print(f"Metadata saved to: {metadata_path}")
     
     return 0 if result["success"] else 1
 

@@ -1,8 +1,8 @@
-# OpenWebUI Backend API Flow (v0.1.1)
+# OpenWebUI Backend API Flow (v0.2.0)
 
 The commands below recreate the automation performed by `test_openwebui.py`. Each step provides a copy/paste-ready shell snippet that persists results under `artifacts/api-flow-demo/`.
 
-New in v0.1.1: the CLI accepts `--no-pong`/`--prefill-only` to seed a chat without requesting the first assistant response. The flow below highlights both variants:
+New in v0.2.0: the CLI now organizes results into timestamped run folders (`artifacts/runs/<timestamp>/`) and records a `metadata.json` manifest next to each `test_result_*.json`. The `--no-pong/--prefill-only` option from v0.1.1 is still available, so the flow below highlights both variants:
 - **3A** runs the original completion (“pong”) path.
 - **3B** prepares a finished chat that waits for user input.
 
